@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 [[ -d testdata ]] || ./scripts/gen_testdata
 
 # Profiles to test (from foundry.toml)
-PROFILES=("${@:-default ir ir-opt via-ir-false-opt-runs-1}")
+PROFILES=("${@:-default ir ir-opt via-ir-false-opt-runs-1 ssa ssa-opt}")
 
 printf "%-25s %-20s %12s %12s %8s\n" "PROFILE" "FILE" "REF_GAS" "YUL_GAS" "SAVE%"
 echo "------------------------- -------------------- ------------ ------------ --------"
