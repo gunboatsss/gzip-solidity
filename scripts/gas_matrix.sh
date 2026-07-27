@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 [[ -d testdata ]] || ./scripts/gen_testdata
 
 if [ $# -eq 0 ]; then
-    PROFILES=(default ir-opt-no-opt ir-opt-opt ssa-no-opt ssa-opt)
+    PROFILES=(default ir-opt-no-opt ir-opt-opt ir-opt-runs1 ir-opt-runs10k no-ir-runs1 no-ir-runs10k ssa-no-opt ssa-opt)
 else
     PROFILES=("$@")
 fi
