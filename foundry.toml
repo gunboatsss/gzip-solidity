@@ -8,4 +8,18 @@ optimizer_runs = 200
 ffi = true
 ignored_warnings = ["2018"]
 
+[profile.ir]
+via_ir = true
+optimizer = false
+
+[profile.ir-opt]
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+
+[profile.via-ir-false-opt-runs-1]
+via_ir = false
+optimizer = true
+optimizer_runs = 1
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
