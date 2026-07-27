@@ -12,9 +12,13 @@ library GzipYul {
     // keccak256("GzipCrc32Mismatch(uint32,uint32)") = 0x6d9f3e27
     // keccak256("GzipIsizeMismatch(uint32,uint32)") = 0x61025233
 
+    /// @dev selector 0xb0f25b04
     error GzipInvalidMagic();
+    /// @dev selector 0x6d1e0b23
     error GzipInputTooShort();
+    /// @dev selector 0x6d9f3e27
     error GzipCrc32Mismatch(uint32 expected, uint32 actual);
+    /// @dev selector 0x61025233
     error GzipIsizeMismatch(uint32 expected, uint32 actual);
 
     function decompress(bytes memory input) internal pure returns (bytes memory output) {
