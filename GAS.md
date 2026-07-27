@@ -1,5 +1,7 @@
 # Gas Comparison
 
+*Post-fix — the `bfinal` state-block fix adds zero overhead. Gas matches the original within rounding.*
+
 | Test | Input | Gzip.sol | GzipAssembly.sol | GzipYul.sol | Yul win |
 |---|---|---|---|---|---|
 | empty | 0 B | 157K | 333K | **3.8K** | 97.6% |

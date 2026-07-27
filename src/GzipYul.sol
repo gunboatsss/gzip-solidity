@@ -8,12 +8,15 @@ pragma solidity ^0.8.13;
 library GzipYul {
     // Error selectors (pre-computed, used directly in assembly)
     // keccak256("GzipInvalidMagic()")      = 0xb0f25b04
+    // keccak256("GzipUnsupportedMethod(uint8)") = 0x4e2edd5b
     // keccak256("GzipInputTooShort()")     = 0x6d1e0b23
     // keccak256("GzipCrc32Mismatch(uint32,uint32)") = 0x6d9f3e27
     // keccak256("GzipIsizeMismatch(uint32,uint32)") = 0x61025233
 
     /// @dev selector 0xb0f25b04
     error GzipInvalidMagic();
+    /// @dev selector 0x4e2edd5b
+    error GzipUnsupportedMethod(uint8 cm);
     /// @dev selector 0x6d1e0b23
     error GzipInputTooShort();
     /// @dev selector 0x6d9f3e27
@@ -42,8 +45,10 @@ library GzipYul {
             let pos := 2
             let cm := shr(248, mload(add(in_ptr, pos)))
             if iszero(eq(cm, 0x08)) {
-                mstore(0, 0xb0f25b0400000000000000000000000000000000000000000000000000000000)
-                revert(0, 4)
+                mstore(0, 0x4e2edd5b00000000000000000000000000000000000000000000000000000000)
+                mstore(32, 0)
+                mstore8(35, cm)
+                revert(0, 36)
             }
             pos := add(pos, 1)
             let flg := shr(248, mload(add(in_ptr, pos)))
@@ -90,13 +95,12 @@ library GzipYul {
             let clen := sub(sub(mload(input), pos), 8)
 
             // ═══════════════════════════════════════════════════════
-            //  STATE BLOCK (heap-allocated, pointer in scratch 0x00)
+            //  STATE BLOCK (heap-allocated)
             //  +0x00 br_data  +0x20 br_len  +0x40 br_bpos  +0x60 br_bitp
-            //  +0x80 ob_data  +0xA0 ob_len  +0xC0 ob_cap
+            //  +0x80 ob_data  +0xA0 ob_len  +0xC0 ob_cap  +0xE0 bfinal
             // ═══════════════════════════════════════════════════════
             let S := mload(0x40)
-            mstore(0x40, add(S, 0xE0))
-            mstore(0x00, S)
+            mstore(0x40, add(S, 0x120))
 
             mstore(add(S, 0x00), add(in_ptr, pos))
             mstore(add(S, 0x20), clen)
@@ -253,6 +257,8 @@ library GzipYul {
                         leave
                     }
                 }
+                // Invalid Huffman code — revert (was silently returning 0)
+                revert(0, 0)
             }
 
             function decodeDynamic(s) -> lit_tbl, dist_tbl {
@@ -381,15 +387,11 @@ library GzipYul {
             }
 
             // ═══════════════════════════════════════════════════════
-            //  LOG helpers (write to event topics)
-            // ═══════════════════════════════════════════════════════
-
-            // ═══════════════════════════════════════════════════════
             //  MAIN BLOCK LOOP
             // ═══════════════════════════════════════════════════════
 
             for { } 1 { } {
-                let bfinal := readBit(S)
+                mstore(add(S, 0xE0), readBit(S))
                 let btype := readBits(S, 2)
 
 
@@ -466,7 +468,7 @@ library GzipYul {
                 }
                 default { revert(0, 0) }
 
-                if bfinal { break }
+                if mload(add(S, 0xE0)) { break }
             }
 
             // ═══════════════════════════════════════════════════════
