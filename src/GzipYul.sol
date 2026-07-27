@@ -398,15 +398,31 @@ library GzipYul {
                 switch btype
                 case 0 {
                     skipToByte(S)
-                    let len := or(readBits(S, 8), shl(8, readBits(S, 8)))
-                    let nlen := or(readBits(S, 8), shl(8, readBits(S, 8)))
+                    // Read len/nlen as raw bytes (bypass readBits to avoid bit-reader bug)
+                    let br_data := mload(add(S, 0x00))
+                    let br_bpos := mload(add(S, 0x40))
+                    let len_lo := and(shr(248, mload(add(br_data, br_bpos))), 0xFF)
+                    br_bpos := add(br_bpos, 1)
+                    let len_hi := and(shr(248, mload(add(br_data, br_bpos))), 0xFF)
+                    br_bpos := add(br_bpos, 1)
+                    let nlen_lo := and(shr(248, mload(add(br_data, br_bpos))), 0xFF)
+                    br_bpos := add(br_bpos, 1)
+                    let nlen_hi := and(shr(248, mload(add(br_data, br_bpos))), 0xFF)
+                    br_bpos := add(br_bpos, 1)
+                    mstore(add(S, 0x40), br_bpos)
+                    mstore(add(S, 0x60), 0)
+                    let len := or(len_lo, shl(8, len_hi))
+                    let nlen := or(nlen_lo, shl(8, nlen_hi))
                     if iszero(eq(len, and(not(nlen), 0xFFFF))) { revert(0, 0) }
                     obGrow(S, len)
                     let od := mload(add(S, 0x80))
                     let ol := mload(add(S, 0xA0))
                     for { let i := 0 } lt(i, len) { i := add(i, 1) } {
-                        mstore8(add(add(od, ol), i), readBits(S, 8))
+                        let b := and(shr(248, mload(add(br_data, br_bpos))), 0xFF)
+                        br_bpos := add(br_bpos, 1)
+                        mstore8(add(add(od, ol), i), b)
                     }
+                    mstore(add(S, 0x40), br_bpos)
                     mstore(add(S, 0xA0), add(ol, len))
                 }
                 case 1 {

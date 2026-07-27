@@ -1,0 +1,4242 @@
+#!/usr/bin/env python3
+# term-cli — Elias Oenal <termcli@eliasoenal.com>
+#
+# Copyright (c) 2026 Elias Oenal <termcli@eliasoenal.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted (subject to the limitations in the disclaimer
+# below) provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice,
+#   this list of conditions and the following disclaimer.
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# * Neither the name of term-cli nor the names of its contributors may be used
+#   to endorse or promote products derived from this software without specific
+#   prior written permission.
+#
+# NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+# THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+# CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
+# NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+term-cli — Non-interactive terminal session control for AI agents (tmux wrapper)
+
+Wraps tmux to provide a stable API for automation. Never attaches or enters interactive UI.
+
+Requires: tmux on PATH (macOS: brew install tmux)
+
+Defaults: 80x24 terminal, visible screen only, trailing whitespace trimmed
+
+Env vars: TERM_CLI_COLS, TERM_CLI_ROWS override default size
+
+Exit codes: 0=success, 1=runtime error, 2=invalid input, 3=timeout, 4=detached, 5=locked, 127=tmux not found
+
+tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left Right,
+           Home End NPage PPage, F1-F12
+
+Quick reference:
+  term-cli start --session NAME [--cols 80] [--rows 24] [--cwd DIR] [--locked]
+  term-cli run --session NAME "cmd" [--wait] [--timeout 10]
+  term-cli capture --session NAME [--scrollback N] [--tail N] [--line-numbers] [--annotate|--no-annotate] [--force]
+  term-cli send-mouse --session NAME (--text TEXT | --x X --y Y) [--button left|right] [--scroll-up [N]|--scroll-down [N]] [--nth N] [--mouse-encoding auto|x10|utf8|sgr]
+  term-cli send-key --session NAME KEY
+  term-cli send-text --session NAME "text" [--enter]
+  term-cli send-stdin --session NAME < file.txt
+  term-cli wait --session NAME [--timeout 10]
+  term-cli wait-idle --session NAME [--idle 2] [--timeout 10]
+  term-cli wait-for --session NAME PATTERN [--timeout 10] [--ignore-case] [--print-match] [--print-match-context N]
+  term-cli status --session NAME
+  term-cli resize --session NAME [--cols N] [--rows N]
+  term-cli pipe-log --session NAME FILE [--raw]
+  term-cli unpipe --session NAME
+  term-cli upload --session NAME LOCAL_PATH [REMOTE_PATH] [--force] [--timeout SEC] [--verbose]
+  term-cli download --session NAME REMOTE_PATH [LOCAL_PATH] [--force] [--timeout SEC] [--verbose]
+  term-cli scroll --session NAME LINES
+  term-cli kill --session NAME [--force]
+  term-cli list
+
+Locked sessions (human controls, agent observes):
+  When a session is locked, the agent can only use: capture, status, wait-*, request*, list, scroll, pipe-log, unpipe
+  Locked commands (run, send-*, kill, resize, upload, download) return exit code 5.
+
+Human assistance (request/response):
+  term-cli request --session NAME --message "help needed"
+  term-cli request-wait --session NAME [--timeout 300]
+  term-cli request-cancel --session NAME
+  term-cli request-status --session NAME
+
+Note: wait-for searches the entire visible screen, including the command echo line.
+
+Short flags: -s (session), -w (wait), -t (timeout/tail), -x (cols), -y (rows),
+             -c (cwd), -n (scrollback), -e (enter/env), -r (raw), -i (idle/ignore-case),
+             -p (print-match), -C (print-match-context), -m (message), -f (force),
+             -u (scroll-up), -d (scroll-down),
+             -l (locked on start / line-numbers on capture)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import gzip
+import hashlib
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+DEFAULT_COLS = 80
+DEFAULT_ROWS = 24
+DEFAULT_HISTORY_LIMIT = 50000
+DEFAULT_WAIT_TIMEOUT = 10.0
+DEFAULT_IDLE_SECONDS = 2.0
+DEFAULT_IDLE_TIMEOUT = 10.0
+DEFAULT_REQUEST_TIMEOUT = 300.0
+
+# Polling configuration for wait operations
+POLL_INTERVAL_INITIAL = 0.1      # Starting poll interval in seconds
+POLL_INTERVAL_MAX = 0.5          # Maximum poll interval (caps gradual increase)
+POLL_INTERVAL_MULTIPLIER = 1.2   # Factor to increase poll interval each iteration
+
+# Prompt detection configuration
+PROMPT_CHARS = frozenset('$%#>):❯')  # Characters that indicate end of prompt
+STABILITY_SAMPLES = 3                 # Number of samples for stability check
+STABILITY_INTERVAL = 0.1              # Interval between stability samples (100ms)
+
+# tmux user option for human assistance requests (using @ prefix for user options)
+# User options can be used directly in tmux format strings with #{@name} syntax
+TERM_CLI_REQUEST_OPT = "@term_cli_request"
+# tmux user option for human response messages
+TERM_CLI_RESPONSE_OPT = "@term_cli_response"
+# tmux user option to signal human detached without completing request
+TERM_CLI_DETACHED_OPT = "@term_cli_detached"
+# tmux user option to lock session (agent can only observe, not interact)
+TERM_CLI_LOCKED_OPT = "@term_cli_agent_locked"
+
+# tmux user option to remember download strategy per session
+TERM_CLI_DL_STRATEGY_OPT = "@term_cli_dl_strategy"
+# tmux user option to store how many lines the _enter_alt_echo_off command
+# occupies on the normal screen (computed from cursor_x + command length +
+# terminal width).  Used by _run_helper and _restore_terminal to erase
+# exactly the right number of lines when leaving alt-screen.
+TERM_CLI_ERASE_LINES_OPT = "@_tc_erase_lines"
+
+# Global tmux socket name (set via -L/--socket-name option)
+_tmux_socket: str | None = None
+
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_RUNTIME_ERROR = 1    # RuntimeError - operation failed
+EXIT_INPUT_ERROR = 2      # ValueError - invalid input
+EXIT_TIMEOUT = 3          # Timeout waiting for condition
+EXIT_DETACHED = 4         # Human detached without completing request
+EXIT_LOCKED = 5           # Session is locked (agent read-only)
+EXIT_NOT_FOUND = 127      # FileNotFoundError - missing dependency
+
+# Transfer defaults
+DEFAULT_TRANSFER_TIMEOUT = 120.0
+MIN_TRANSFER_COLS = 40       # Minimum terminal width for file transfers
+PIPE_CHECKPOINT_LINES = 50
+
+# ---------------------------------------------------------------------------
+# Annotation constants — 2D spatial frequency highlight detection
+# ---------------------------------------------------------------------------
+
+# Minimum RGB Euclidean distance from structural bg to count as a highlight
+ANNOTATION_PROXIMITY_DIST = 40.0
+# Minimum RGB distance for column-disruption signal
+ANNOTATION_COL_DISRUPTION_DIST = 50.0
+# Connected component minimum height (rows) to be considered structural
+ANNOTATION_STRUCTURAL_HEIGHT = 4
+# Minimum area fraction of total screen for a region to be structural
+ANNOTATION_STRUCTURAL_AREA_PCT = 0.10
+# Region must span this fraction of screen height to be structural by height alone
+ANNOTATION_STRUCTURAL_ROW_SPAN = 0.30
+# Bg key must appear on >= this fraction of rows to be globally widespread
+ANNOTATION_WIDESPREAD_ROW_PCT = 0.40
+# Bg key must cover >= this fraction of total cells to be globally widespread
+ANNOTATION_WIDESPREAD_CELL_PCT = 0.05
+# Max region height for column-disruption highlights
+ANNOTATION_MAX_DISRUPTION_HEIGHT = 3
+# Fraction of box-drawing / braille chars that marks text as decorative
+ANNOTATION_DECORATIVE_RATIO = 0.60
+
+
+class OperationTimeout(Exception):
+    """Raised when an operation times out waiting for a condition."""
+    pass
+
+
+class HumanDetached(Exception):
+    """Raised when human detaches from session without completing request."""
+    pass
+
+
+class AgentLocked(Exception):
+    """Raised when agent tries to interact with a locked session."""
+    pass
+
+
+class QueryResult(Exception):
+    """Non-error result requiring a specific exit code (e.g., query returned 'not found')."""
+    def __init__(self, message: str, exit_code: int = EXIT_RUNTIME_ERROR) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def _eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+def _tmux_path() -> str:
+    p = shutil.which("tmux")
+    if not p:
+        raise FileNotFoundError("tmux not found on PATH. Install tmux (macOS: `brew install tmux`).")
+    return p
+
+@dataclass
+class CmdResult:
+    ok: bool
+    code: int
+    stdout: str
+    stderr: str
+
+def _run_tmux(args: list[str]) -> CmdResult:
+    tmux = _tmux_path()
+    cmd_args = list(args)
+    if _tmux_socket:
+        cmd_args = ["-L", _tmux_socket] + cmd_args
+    proc = subprocess.run(
+        [tmux, *cmd_args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return CmdResult(ok=(proc.returncode == 0), code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+def _exact(session: str) -> str:
+    """Format session name for exact tmux target matching.
+
+    tmux's ``-t`` flag resolves targets by trying, in order: session ID
+    (``$``-prefixed), exact name, **prefix match**, then glob.  The prefix
+    step means ``-t foo`` silently matches ``foobar`` when ``foo`` doesn't
+    exist.  Prefixing with ``=`` forces exact-name-only matching.
+
+    The trailing ``:`` makes this a valid target for both session-level
+    commands (``has-session``, ``set-option``) and pane/window-level
+    commands (``capture-pane``, ``send-keys``).  Without it, pane commands
+    fail with "can't find pane: =name".
+    """
+    return f"={session}:"
+
+def _session_exists(session: str) -> bool:
+    res = _run_tmux(["has-session", "-t", _exact(session)])
+    return res.ok
+
+def _require_session(session: str) -> None:
+    if not _session_exists(session):
+        raise ValueError(f"Session '{session}' does not exist. Create it with: term-cli start --session {session}")
+
+def _env_int(name: str) -> int | None:
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        raise ValueError(f"Environment variable {name} must be an integer, got: {v!r}")
+
+
+def _size_defaults() -> tuple[int, int]:
+    cols = _env_int("TERM_CLI_COLS")
+    rows = _env_int("TERM_CLI_ROWS")
+    return (cols if cols is not None else DEFAULT_COLS,
+            rows if rows is not None else DEFAULT_ROWS)
+
+def _trim_output(text: str) -> str:
+    """Remove trailing whitespace and blank lines."""
+    lines = text.rstrip().split('\n')
+    # Remove trailing empty lines
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return '\n'.join(lines)
+
+def _get_pane_dimensions(session: str) -> tuple[int, int]:
+    """Get current pane width and height."""
+    res = _run_tmux(["display-message", "-p", "-t", _exact(session), "#{pane_width}\t#{pane_height}"])
+    if not res.ok:
+        return (DEFAULT_COLS, DEFAULT_ROWS)
+    parts = res.stdout.strip().split('\t')
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError):
+        return (DEFAULT_COLS, DEFAULT_ROWS)
+
+def _capture_screen(session: str, trim: bool = True, raw: bool = False, 
+                    join_wrapped: bool = False,
+                    preserve_trailing: bool = False) -> str:
+    """Capture only the visible screen content (not scrollback).
+    
+    Args:
+        session: tmux session name
+        trim: Remove trailing whitespace and blank lines
+        raw: Include ANSI escape sequences
+        join_wrapped: Join wrapped lines (-J flag). Default False to preserve
+                      physical screen layout. Set True for logical line capture
+                      (e.g., scrollback).
+        preserve_trailing: Preserve trailing spaces at each line's end (-N flag).
+                           When True, wrapped lines will have len == pane_width
+                           while non-wrapped lines will be shorter, allowing
+                           reliable wrap detection.  Implies trim=False.
+    """
+    # -p prints to stdout, -J joins wrapped lines, -e includes escape sequences (colors)
+    tmux_args = ["capture-pane", "-p", "-t", _exact(session)]
+    if join_wrapped:
+        tmux_args.insert(2, "-J")
+    if raw:
+        tmux_args.insert(2, "-e")  # Add -e flag for escape sequences
+    if preserve_trailing:
+        tmux_args.insert(2, "-N")
+    res = _run_tmux(tmux_args)
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to capture pane")
+    output = res.stdout
+    if trim and not preserve_trailing:
+        output = _trim_output(output)
+    return output
+
+def _get_cursor_position(session: str) -> tuple[int, int] | None:
+    """Get cursor position (x, y) in the pane. Returns None on failure."""
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", "#{cursor_x}\t#{cursor_y}"])
+    if not res.ok:
+        return None
+    try:
+        parts = res.stdout.strip().split('\t')
+        return (int(parts[0]), int(parts[1]))
+    except (ValueError, IndexError):
+        return None
+
+
+def _format_cursor_row_col(cursor: tuple[int, int]) -> str:
+    """Format tmux cursor (x,y 0-based) as display row,col 1-based."""
+    x, y = cursor
+    return f"{y + 1},{x + 1}"
+
+
+def _is_alternate_screen(session: str) -> bool:
+    """Return True when session pane is in alternate screen mode."""
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", "#{alternate_on}"])
+    return res.ok and res.stdout.strip() == "1"
+
+@dataclass
+class PaneMetadata:
+    """Pane state fetched in a single tmux query for annotated capture."""
+    cursor: tuple[int, int] | None   # (x, y) 0-based, or None on failure
+    alternate: bool                   # True when alternate screen (TUI) is active
+    bell: bool                        # True if bell was rung since last clear
+
+
+@dataclass
+class MouseMode:
+    """Mouse protocol/mode flags reported by tmux for the active pane."""
+
+    any: bool
+    standard: bool
+    button: bool
+    all_motion: bool
+    utf8: bool
+    sgr: bool
+
+    def preferred_encoding(self) -> str | None:
+        """Best encoding for this pane, or None when mouse is disabled."""
+        if not self.any:
+            return None
+        if self.sgr:
+            return "sgr"
+        if self.utf8:
+            return "utf8"
+        return "x10"
+
+    def status_string(self) -> str:
+        """Detailed one-line status string for `status` output."""
+        pref = self.preferred_encoding() or "off"
+        return (
+            f"{pref} (std={int(self.standard)} btn={int(self.button)} "
+            f"all={int(self.all_motion)} utf8={int(self.utf8)} sgr={int(self.sgr)})"
+        )
+
+
+def _get_mouse_mode(session: str) -> MouseMode | None:
+    """Read tmux mouse mode flags for the active pane."""
+    fmt = (
+        "#{mouse_any_flag}\t#{mouse_standard_flag}\t#{mouse_button_flag}\t"
+        "#{mouse_all_flag}\t#{mouse_utf8_flag}\t#{mouse_sgr_flag}"
+    )
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", fmt])
+    if not res.ok:
+        return None
+    parts = res.stdout.strip().split("\t")
+    if len(parts) != 6:
+        return None
+    return MouseMode(
+        any=parts[0] == "1",
+        standard=parts[1] == "1",
+        button=parts[2] == "1",
+        all_motion=parts[3] == "1",
+        utf8=parts[4] == "1",
+        sgr=parts[5] == "1",
+    )
+
+def _get_pane_metadata(session: str) -> PaneMetadata:
+    """Fetch cursor, screen mode, and bell flag in one tmux call."""
+    fmt = "#{cursor_x}\t#{cursor_y}\t#{alternate_on}\t#{window_bell_flag}"
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", fmt])
+    if not res.ok:
+        return PaneMetadata(cursor=None, alternate=False, bell=False)
+    try:
+        parts = res.stdout.strip().split('\t', 3)
+        cursor: tuple[int, int] | None = (int(parts[0]), int(parts[1]))
+        alternate = parts[2] == "1"
+        bell = parts[3] == "1" if len(parts) > 3 else False
+        return PaneMetadata(cursor=cursor, alternate=alternate, bell=bell)
+    except (ValueError, IndexError):
+        return PaneMetadata(cursor=None, alternate=False, bell=False)
+
+def _clear_alert_flags(session: str) -> None:
+    """Clear bell/activity/silence alert flags on the session."""
+    _run_tmux(["kill-session", "-C", "-t", _exact(session)])
+
+def _cursor_at_prompt(lines: list[str], cursor_x: int, cursor_y: int,
+                      pane_width: int = 0) -> bool:
+    """Check if the cursor is positioned at a shell prompt.
+
+    Detects the pattern ``prompt_char + whitespace_gap + cursor`` by looking
+    at the two character positions immediately before the cursor.  When a
+    lookback crosses a line boundary (``cursor_x < 2``), it underflows into
+    the previous line using ``pane_width`` to compute the column — but only
+    if the previous line actually filled the pane width, since a terminal
+    wrap can only occur when a line reaches the last column.
+
+    The caller should capture with ``-N`` (preserve trailing spaces) so that
+    real whitespace at the pane edge is retained in the capture.  Positions
+    beyond the captured line content are treated as implicit spaces (empty
+    terminal cells).
+
+    ``pane_width`` is required for line-boundary underflow (must be > 0).
+    When unavailable, only the simple case (``cursor_x >= 2``) is checked.
+
+    Matches prompts like ``"$ "``, ``"(lldb) "``, ``">>> "``.
+    """
+
+    def _char_at(x: int, y: int) -> str | None:
+        """Return the character at terminal position (x, y).
+
+        If *x* is negative the position underflows into the previous line
+        using *pane_width*.  The previous line must have ``len == pane_width``
+        (i.e. it filled the pane) because a terminal line can only wrap when
+        all columns are occupied.  Positions beyond the captured line content
+        return ``' '`` (implicit empty terminal cell).
+        """
+        if x < 0:
+            if pane_width <= 0:
+                return None
+            y -= 1
+            if y < 0 or y >= len(lines):
+                return None
+            # A line only wraps when it fills the entire pane width.
+            if len(lines[y]) != pane_width:
+                return None
+            x += pane_width
+            return lines[y][x] if x < len(lines[y]) else ' '
+        if y < 0 or y >= len(lines):
+            return None
+        line = lines[y]
+        return line[x] if x < len(line) else ' '
+
+    gap_char = _char_at(cursor_x - 1, cursor_y)
+    prompt_char = _char_at(cursor_x - 2, cursor_y)
+
+    if prompt_char is None or gap_char is None:
+        return False
+    if gap_char not in " \t":
+        return False
+    return prompt_char in PROMPT_CHARS
+
+
+def _check_stability(session: str) -> bool:
+    """Check if screen remains stable (unchanged) across multiple samples.
+    
+    Takes STABILITY_SAMPLES screen captures with STABILITY_INTERVAL between them.
+    Returns True only if all samples are identical.
+    """
+    prev_screen = _capture_screen(session, trim=False, join_wrapped=False)
+    
+    for _ in range(STABILITY_SAMPLES - 1):
+        time.sleep(STABILITY_INTERVAL)
+        curr_screen = _capture_screen(session, trim=False, join_wrapped=False)
+        if curr_screen != prev_screen:
+            return False
+        prev_screen = curr_screen
+    
+    return True
+
+
+def _is_at_prompt(session: str) -> bool:
+    """Check if the terminal is at a shell prompt, ready for input.
+    
+    Uses cursor position + prompt pattern + stability check:
+    1. Get the line where cursor is located
+    2. Check if that line ends with 'prompt_char + space' and cursor is at end
+    3. Verify screen is stable (not actively scrolling output)
+    
+    This handles:
+    - Standard shells (bash, zsh) and REPLs (python, node)
+    - Debuggers with status bars (lldb, gdb) where prompt is above status line
+    - Avoids false positives from scrolling output containing prompt-like chars
+    """
+    # Use -N (preserve trailing spaces) so that wrapped lines have
+    # len == pane_width while non-wrapped lines are shorter.  This lets
+    # _cursor_at_prompt reliably distinguish wraps from newlines.
+    screen = _capture_screen(session, preserve_trailing=True, join_wrapped=False)
+    if not screen:
+        return False
+    
+    cursor_pos = _get_cursor_position(session)
+    if cursor_pos is None:
+        return False
+    cursor_x, cursor_y = cursor_pos
+    
+    lines = screen.split('\n')
+    
+    pane_width, _ = _get_pane_dimensions(session)
+    
+    if not _cursor_at_prompt(lines, cursor_x, cursor_y, pane_width=pane_width):
+        return False
+    
+    # Stability check: screen must remain unchanged across multiple samples
+    # This prevents false positives from output scrolling by with prompt-like chars
+    return _check_stability(session)
+
+def _wait_for_prompt(session: str, timeout: float) -> tuple[bool, float]:
+    """Wait for shell prompt to appear. Returns (success, elapsed_time).
+    
+    Polls _is_at_prompt which includes a stability check, so this function
+    simply loops until prompt is detected or timeout is reached.
+    """
+    start = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+    
+    while True:
+        if _is_at_prompt(session):
+            return (True, time.time() - start)
+        if time.time() - start >= timeout:
+            return (False, time.time() - start)
+        time.sleep(poll_interval)
+        # Increase poll interval gradually to reduce overhead
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+def _wait_for_idle(session: str, idle_seconds: float, timeout: float) -> tuple[bool, float]:
+    """Wait until no output for idle_seconds. Returns (success, elapsed_time)."""
+    start = time.time()
+    last_content = _capture_screen(session, trim=False)
+    last_change = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+    
+    while True:
+        current_content = _capture_screen(session, trim=False)
+        if current_content != last_content:
+            last_content = current_content
+            last_change = time.time()
+            # Reset poll interval when content changes (activity detected)
+            poll_interval = POLL_INTERVAL_INITIAL
+        
+        idle_time = time.time() - last_change
+        if idle_time >= idle_seconds:
+            return (True, time.time() - start)
+        
+        elapsed = time.time() - start
+        if elapsed >= timeout:
+            return (False, elapsed)
+        
+        time.sleep(poll_interval)
+        # Increase poll interval gradually to reduce CPU usage during long waits
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+def _wait_for_text(session: str, text: str, timeout: float) -> tuple[bool, float]:
+    """Wait for *text* to appear on the visible screen. Returns (success, elapsed_time).
+
+    Uses the same adaptive polling pattern as ``_wait_for_prompt``.
+    The search is a plain substring match on the captured screen content
+    (ANSI-stripped, trimmed).
+    """
+    start = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+
+    while True:
+        screen = _capture_screen(session, trim=True, join_wrapped=True)
+        if text in screen:
+            return (True, time.time() - start)
+        if time.time() - start >= timeout:
+            return (False, time.time() - start)
+        time.sleep(poll_interval)
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+def _wait_for_any_text(
+    session: str, texts: list[str], timeout: float,
+) -> tuple[str | None, float]:
+    """Wait for any of *texts* to appear on screen.
+
+    Returns ``(matched_text, elapsed)`` where *matched_text* is the first
+    element of *texts* found on screen, or ``None`` on timeout.
+    """
+    start = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+
+    while True:
+        screen = _capture_screen(session, trim=True, join_wrapped=True)
+        for t in texts:
+            if t in screen:
+                return (t, time.time() - start)
+        if time.time() - start >= timeout:
+            return (None, time.time() - start)
+        time.sleep(poll_interval)
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+# ---------------------------------------------------------------------------
+# Annotation utilities — 2D spatial frequency highlight detection
+# ---------------------------------------------------------------------------
+
+# Standard 8-color and bright palette for resolving basic/bright SGR codes
+_BASIC_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (0, 0, 0), 1: (170, 0, 0), 2: (0, 170, 0), 3: (170, 170, 0),
+    4: (0, 0, 170), 5: (170, 0, 170), 6: (0, 170, 170), 7: (170, 170, 170),
+}
+_BRIGHT_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (85, 85, 85), 1: (255, 85, 85), 2: (85, 255, 85), 3: (255, 255, 85),
+    4: (85, 85, 255), 5: (255, 85, 255), 6: (85, 255, 255), 7: (255, 255, 255),
+}
+_BASIC_NAMES: dict[int, str] = {
+    0: "black", 1: "red", 2: "green", 3: "yellow",
+    4: "blue", 5: "magenta", 6: "cyan", 7: "white",
+}
+
+# Box-drawing, block elements, and braille characters
+_DECORATIVE_CODEPOINTS = frozenset(range(0x2500, 0x25A0)) | frozenset(range(0x2800, 0x2900))
+# ASCII punctuation often mixed with box-drawing in title bars
+_BORDER_PUNCT = frozenset("<>[]{}() .^+-|")
+
+# Regex matching only SGR sequences (ESC [ params m)
+_ANSI_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
+# Regex matching all non-SGR escape sequences (CSI non-m, OSC, charset select)
+_ANSI_OTHER_RE = re.compile(
+    r"\033\[[0-9;?]*[A-LN-Za-ln-z]"        # CSI sequences except 'm'
+    r"|\033\][^\x07\033]*(?:\x07|\033\\)"   # OSC sequences
+    r"|\033[()][0-9A-Z]"                    # Charset selection
+)
+
+# Assumed terminal defaults.  Used when no explicit colour has been set.
+_DEFAULT_FG = (255, 255, 255)
+_DEFAULT_BG = (0, 0, 0)
+
+
+def _color_256_to_rgb(idx: int) -> tuple[int, int, int] | None:
+    """Convert 256-color palette index to RGB. Returns None for invalid."""
+    if idx < 0 or idx > 255:
+        return None
+    if idx < 8:
+        return _BASIC_COLORS[idx]
+    if idx < 16:
+        return _BRIGHT_COLORS[idx - 8]
+    if idx < 232:
+        # 6x6x6 xterm color cube: indices 16-231
+        idx -= 16
+        b_idx = idx % 6
+        g_idx = (idx // 6) % 6
+        r_idx = idx // 36
+
+        def cube(v: int) -> int:
+            # xterm cube levels are 0,95,135,175,215,255
+            return 0 if v == 0 else 55 + 40 * v
+
+        return (cube(r_idx), cube(g_idx), cube(b_idx))
+    # Grayscale ramp: indices 232-255
+    v = 8 + (idx - 232) * 10
+    return (v, v, v)
+
+
+def _safe_sgr_int(s: str) -> int:
+    """Parse int from SGR param, treating empty/invalid as 0."""
+    if not s:
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        return 0
+
+
+def _safe_rgb(params: list[str], offset: int) -> tuple[int, int, int] | None:
+    """Parse R;G;B from params at *offset*, clamping to 0-255."""
+    try:
+        r = max(0, min(255, int(params[offset])))
+        g = max(0, min(255, int(params[offset + 1])))
+        b = max(0, min(255, int(params[offset + 2])))
+        return (r, g, b)
+    except (ValueError, IndexError):
+        return None
+
+
+def _resolve_colors(
+    reverse: bool,
+    fg_rgb: tuple[int, int, int] | None,
+    fg_basic: int | None,
+    bg_rgb: tuple[int, int, int] | None,
+    bg_basic: int | None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Resolve effective (fg, bg) colours to concrete RGB values.
+
+    Applies reverse-video swap and fills in terminal defaults so callers
+    always receive two concrete RGB tuples.
+    """
+    fg: tuple[int, int, int]
+    if fg_rgb is not None:
+        fg = fg_rgb
+    elif fg_basic is not None:
+        fg = _BASIC_COLORS.get(fg_basic, _DEFAULT_FG)
+    else:
+        fg = _DEFAULT_FG
+
+    bg: tuple[int, int, int]
+    if bg_rgb is not None:
+        bg = bg_rgb
+    elif bg_basic is not None:
+        bg = _BASIC_COLORS.get(bg_basic, _DEFAULT_BG)
+    else:
+        bg = _DEFAULT_BG
+
+    if reverse:
+        fg, bg = bg, fg
+    return fg, bg
+
+
+def _parse_raw_screen(raw_text: str) -> list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]]:
+    """Parse raw ANSI text into per-row lists of styled segments.
+
+    Each segment is ``(text, fg_rgb, bg_rgb, bold)`` with fully resolved
+    concrete RGB values.  Reverse video is resolved at parse time — the
+    fg and bg colours are swapped so downstream code never needs to reason
+    about reverse state.  Terminal defaults are filled in as ``_DEFAULT_FG``
+    and ``_DEFAULT_BG``.
+
+    Every row is padded to the full terminal width (determined by the widest
+    row in the capture).  Padding cells use the active fg/bg/bold state at
+    end of line — matching real terminal behaviour where the erase colour
+    fills to the right margin.
+
+    ANSI state (fg, bg, bold, reverse) carries across line boundaries —
+    tmux ``capture-pane -p -e`` emits a continuous stream where a color
+    set on one row persists until explicitly changed or reset.
+    """
+    raw_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # First pass: parse segments and record trailing style per row.
+    # Each entry: (segments, char_count, (trail_fg, trail_bg, trail_bold))
+    parsed: list[
+        tuple[
+            list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]],
+            int,
+            tuple[tuple[int, int, int], tuple[int, int, int], bool],
+        ]
+    ] = []
+
+    fg_rgb: tuple[int, int, int] | None = None
+    bg_rgb: tuple[int, int, int] | None = None
+    fg_basic: int | None = None
+    bg_basic: int | None = None
+    bold = False
+    reverse = False
+
+    max_cols = 0
+
+    for line in raw_text.split("\n"):
+        line = _ANSI_OTHER_RE.sub("", line)
+        segments: list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]] = []
+        char_count = 0
+        pos = 0
+
+        for m in _ANSI_SGR_RE.finditer(line):
+            text = line[pos:m.start()]
+            if text:
+                fg, bg = _resolve_colors(reverse, fg_rgb, fg_basic, bg_rgb, bg_basic)
+                segments.append((text, fg, bg, bold))
+                char_count += len(text)
+            pos = m.end()
+
+            params = m.group(1).split(";") if m.group(1) else ["0"]
+            j = 0
+            while j < len(params):
+                p = _safe_sgr_int(params[j])
+                if p == 0:
+                    fg_rgb = bg_rgb = None
+                    fg_basic = bg_basic = None
+                    bold = reverse = False
+                elif p == 1:
+                    bold = True
+                elif p == 7:
+                    reverse = True
+                elif p == 22:
+                    bold = False
+                elif p == 27:
+                    reverse = False
+                elif 30 <= p <= 37:
+                    fg_basic = p - 30
+                    fg_rgb = None
+                elif 90 <= p <= 97:
+                    fg_basic = p - 90
+                    fg_rgb = _BRIGHT_COLORS.get(p - 90)
+                elif p == 38:
+                    if (j + 1 < len(params) and params[j + 1] == "2"
+                            and j + 4 < len(params)):
+                        rgb = _safe_rgb(params, j + 2)
+                        if rgb:
+                            fg_rgb = rgb
+                            fg_basic = None
+                        j += 4
+                    elif (j + 1 < len(params) and params[j + 1] == "5"
+                          and j + 2 < len(params)):
+                        idx = _safe_sgr_int(params[j + 2])
+                        c = _color_256_to_rgb(idx)
+                        if c:
+                            fg_rgb = c
+                            fg_basic = None
+                        j += 2
+                elif p == 39:
+                    fg_rgb = None
+                    fg_basic = None
+                elif 40 <= p <= 47:
+                    bg_basic = p - 40
+                    bg_rgb = None
+                elif 100 <= p <= 107:
+                    bg_basic = p - 100
+                    bg_rgb = _BRIGHT_COLORS.get(p - 100)
+                elif p == 48:
+                    if (j + 1 < len(params) and params[j + 1] == "2"
+                            and j + 4 < len(params)):
+                        rgb = _safe_rgb(params, j + 2)
+                        if rgb:
+                            bg_rgb = rgb
+                            bg_basic = None
+                        j += 4
+                    elif (j + 1 < len(params) and params[j + 1] == "5"
+                          and j + 2 < len(params)):
+                        idx = _safe_sgr_int(params[j + 2])
+                        c = _color_256_to_rgb(idx)
+                        if c:
+                            bg_rgb = c
+                            bg_basic = None
+                        j += 2
+                elif p == 49:
+                    bg_rgb = None
+                    bg_basic = None
+                j += 1
+
+        text = line[pos:]
+        if text:
+            fg, bg = _resolve_colors(reverse, fg_rgb, fg_basic, bg_rgb, bg_basic)
+            segments.append((text, fg, bg, bold))
+            char_count += len(text)
+
+        # Record the resolved style at end of line for padding.
+        trail_fg, trail_bg = _resolve_colors(
+            reverse, fg_rgb, fg_basic, bg_rgb, bg_basic,
+        )
+        parsed.append((segments, char_count, (trail_fg, trail_bg, bold)))
+        if char_count > max_cols:
+            max_cols = char_count
+
+    # Second pass: pad each row to full terminal width.
+    all_rows: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]] = []
+    for segments, char_count, (t_fg, t_bg, t_bold) in parsed:
+        pad = max_cols - char_count
+        if pad > 0:
+            segments.append((" " * pad, t_fg, t_bg, t_bold))
+        all_rows.append(segments)
+
+    return all_rows
+
+
+def _color_label(bg_rgb: tuple[int, int, int]) -> str:
+    """Human-readable color label for annotations."""
+    for idx, c in _BASIC_COLORS.items():
+        if bg_rgb == c:
+            return f"bg:{_BASIC_NAMES[idx]}"
+    for idx, c in _BRIGHT_COLORS.items():
+        if bg_rgb == c:
+            return f"bg:bright-{_BASIC_NAMES[idx]}"
+    return f"bg:rgb({bg_rgb[0]},{bg_rgb[1]},{bg_rgb[2]})"
+
+
+def _color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    """Euclidean distance in RGB space."""
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
+def _is_decorative_text(text: str) -> bool:
+    """True if text is purely box-drawing, block elements, or braille."""
+    return bool(text) and all(ord(c) in _DECORATIVE_CODEPOINTS or c == " " for c in text)
+
+
+def _is_panel_chrome(text: str) -> bool:
+    """True if text looks like panel border/title chrome (mostly box-drawing)."""
+    if _is_decorative_text(text):
+        return True
+    chrome = sum(1 for c in text if ord(c) in _DECORATIVE_CODEPOINTS or c in _BORDER_PUNCT)
+    return len(text) > 0 and chrome / len(text) > ANNOTATION_DECORATIVE_RATIO
+
+
+@dataclass
+class _AnnotationRegion:
+    """Connected component of same-bg cells in the screen grid."""
+
+    bg_key: tuple[int, int, int]
+    cells: set[tuple[int, int]] = field(default_factory=set)
+    min_row: int = sys.maxsize
+    max_row: int = -1
+    min_col: int = sys.maxsize
+    max_col: int = -1
+
+    def add(self, r: int, c: int) -> None:
+        self.cells.add((r, c))
+        self.min_row = min(self.min_row, r)
+        self.max_row = max(self.max_row, r)
+        self.min_col = min(self.min_col, c)
+        self.max_col = max(self.max_col, c)
+
+    @property
+    def height(self) -> int:
+        return self.max_row - self.min_row + 1
+
+    @property
+    def width(self) -> int:
+        return self.max_col - self.min_col + 1
+
+    @property
+    def area(self) -> int:
+        return len(self.cells)
+
+
+def _build_bg_grid(
+    all_rows: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]],
+) -> tuple[list[list[tuple[int, int, int]]], int, int]:
+    """Expand parsed segments into a per-cell 2D grid of bg colors.
+
+    Rows are expected to be pre-padded to full terminal width by the parser.
+    """
+    expanded: list[list[tuple[int, int, int]]] = []
+    max_cols = 0
+    for row_segs in all_rows:
+        row: list[tuple[int, int, int]] = []
+        for text, _fg, bg, _bold in row_segs:
+            row.extend(bg for _ in text)
+        expanded.append(row)
+        max_cols = max(max_cols, len(row))
+    return expanded, len(expanded), max_cols
+
+
+def _flood_fill_regions(
+    grid: list[list[tuple[int, int, int]]], num_rows: int, num_cols: int,
+) -> list[_AnnotationRegion]:
+    """4-connected flood-fill to find regions of identical bg."""
+    visited = [[False] * num_cols for _ in range(num_rows)]
+    regions: list[_AnnotationRegion] = []
+    for r in range(num_rows):
+        for c in range(num_cols):
+            if visited[r][c]:
+                continue
+            key = grid[r][c]
+            region = _AnnotationRegion(bg_key=key)
+            stack = [(r, c)]
+            visited[r][c] = True
+            while stack:
+                cr, cc = stack.pop()
+                region.add(cr, cc)
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = cr + dr, cc + dc
+                    if 0 <= nr < num_rows and 0 <= nc < num_cols:
+                        if not visited[nr][nc] and grid[nr][nc] == key:
+                            visited[nr][nc] = True
+                            stack.append((nr, nc))
+            regions.append(region)
+    return regions
+
+
+def _column_dominant_bg(
+    grid: list[list[tuple[int, int, int]]], num_rows: int, num_cols: int,
+) -> list[tuple[int, int, int]]:
+    """Per-column most-frequent bg color."""
+    dominants: list[tuple[int, int, int]] = []
+    for c in range(num_cols):
+        freq: dict[tuple[int, int, int], int] = {}
+        for r in range(num_rows):
+            key = grid[r][c]
+            freq[key] = freq.get(key, 0) + 1
+        dominants.append(max(freq, key=lambda k: freq[k]))
+    return dominants
+
+
+def _row_disruption_runs(
+    grid: list[list[tuple[int, int, int]]], num_rows: int, num_cols: int,
+    col_dominant: list[tuple[int, int, int]],
+) -> list[list[tuple[int, int, tuple[int, int, int]]]]:
+    """Per-row contiguous runs of cells differing from their column dominant.
+
+    Returns for each row a list of (start_col, end_col, bg_color) tuples.
+    """
+    all_runs: list[list[tuple[int, int, tuple[int, int, int]]]] = []
+    for r in range(num_rows):
+        runs: list[tuple[int, int, tuple[int, int, int]]] = []
+        run_start: int | None = None
+        run_key: tuple[int, int, int] | None = None
+        for c in range(num_cols):
+            cur = grid[r][c]
+            is_disrupted = cur != col_dominant[c]
+            if is_disrupted:
+                if run_start is None:
+                    run_start = c
+                    run_key = cur
+                elif cur != run_key:
+                    assert run_key is not None
+                    runs.append((run_start, c - 1, run_key))
+                    run_start = c
+                    run_key = cur
+            else:
+                if run_start is not None:
+                    assert run_key is not None
+                    runs.append((run_start, c - 1, run_key))
+                    run_start = None
+                    run_key = None
+        if run_start is not None:
+            assert run_key is not None
+            runs.append((run_start, num_cols - 1, run_key))
+        all_runs.append(runs)
+    return all_runs
+
+
+def _annotate_raw(raw_text: str) -> list[tuple[int, str, str]]:
+    """Analyse raw ANSI capture and return highlight annotations.
+
+    Uses 2D spatial frequency analysis: large connected regions of the same
+    background colour are structural (panels, chrome); small/short regions
+    that disrupt vertical continuity are highlights (selected items, active
+    elements, status bars).
+
+    Returns a list of (0-based_row, text_preview, color_label) tuples.
+    """
+    all_rows = _parse_raw_screen(raw_text)
+    grid, num_rows, num_cols = _build_bg_grid(all_rows)
+    if num_rows == 0 or num_cols == 0:
+        return []
+
+    total_cells = num_rows * num_cols
+
+    # --- Connected component analysis ---
+    regions = _flood_fill_regions(grid, num_rows, num_cols)
+    region_at: list[list[int]] = [[-1] * num_cols for _ in range(num_rows)]
+    for idx, reg in enumerate(regions):
+        for r, c in reg.cells:
+            region_at[r][c] = idx
+
+    # --- Global bg statistics ---
+    bg_row_coverage: dict[tuple[int, int, int], set[int]] = defaultdict(set)
+    bg_total_cells: dict[tuple[int, int, int], int] = defaultdict(int)
+    for r in range(num_rows):
+        for c in range(num_cols):
+            key = grid[r][c]
+            bg_row_coverage[key].add(r)
+            bg_total_cells[key] += 1
+
+    # --- Classify structural regions ---
+    structural_ids: set[int] = set()
+    for idx, reg in enumerate(regions):
+        if reg.bg_key == _DEFAULT_BG:
+            structural_ids.add(idx)
+            continue
+        frac = reg.area / total_cells
+        if frac >= ANNOTATION_STRUCTURAL_AREA_PCT and reg.height >= ANNOTATION_STRUCTURAL_HEIGHT:
+            structural_ids.add(idx)
+        elif reg.height >= num_rows * ANNOTATION_STRUCTURAL_ROW_SPAN:
+            structural_ids.add(idx)
+
+    structural_keys: set[tuple[int, int, int]] = {_DEFAULT_BG}
+    for idx in structural_ids:
+        structural_keys.add(regions[idx].bg_key)
+
+    # Globally widespread keys (fragmented by grid lines into many small regions)
+    for key, rows_set in bg_row_coverage.items():
+        row_pct = len(rows_set) / num_rows
+        cell_pct = bg_total_cells[key] / total_cells
+        if row_pct >= ANNOTATION_WIDESPREAD_ROW_PCT and cell_pct >= ANNOTATION_WIDESPREAD_CELL_PCT:
+            structural_keys.add(key)
+
+    # --- Spatial metrics ---
+    col_dominant = _column_dominant_bg(grid, num_rows, num_cols)
+    disruption_runs = _row_disruption_runs(grid, num_rows, num_cols, col_dominant)
+
+    # --- Row text extraction helper ---
+    def _row_text_by_bg(r: int) -> dict[tuple[int, int, int], list[str]]:
+        """Extract text segments by bg colour for a row.
+
+        Returns a list of separate text pieces per bg colour.  Segments
+        separated by other-bg regions become separate list entries so the
+        caller can distinguish connected text from disjoint labels.
+        """
+        # Build (col_start, text, bg) list
+        entries: list[tuple[int, str, tuple[int, int, int]]] = []
+        col = 0
+        for text, _fg, bg, _bold in all_rows[r]:
+            entries.append((col, text, bg))
+            col += len(text)
+
+        # Group contiguous text per bg; a spatial gap starts a new segment.
+        segments: dict[tuple[int, int, int], list[list[str]]] = defaultdict(lambda: [[]])
+        prev_end: dict[tuple[int, int, int], int] = {}
+        for col_start, text, bg in entries:
+            if bg in prev_end and col_start > prev_end[bg]:
+                # Gap — start a new segment for this bg
+                segments[bg].append([])
+            segments[bg][-1].append(text)
+            prev_end[bg] = col_start + len(text)
+
+        result: dict[tuple[int, int, int], list[str]] = {}
+        for k, seg_groups in segments.items():
+            pieces = [re.sub(r"  +", " ", "".join(g)).strip() for g in seg_groups]
+            pieces = [p for p in pieces if p]
+            if pieces:
+                result[k] = pieces
+        return result
+
+    # === SIGNAL A: non-structural bg content ===
+    # All signals run independently.  Results are deduplicated at the end:
+    # when multiple signals report the same (row, bg_label), the entry with
+    # the longest text wins (Signal C's combined bar text > Signal B's
+    # single element, for example).
+    results: list[tuple[int, str, str]] = []
+    seen_a: set[int] = set()
+
+    for r in range(num_rows):
+        row_text_map = _row_text_by_bg(r)
+        for key, pieces in row_text_map.items():
+            if key in structural_keys:
+                continue
+
+            # Proximity filter
+            if any(_color_distance(key, s) < ANNOTATION_PROXIMITY_DIST
+                   for s in structural_keys):
+                continue
+
+            # Join pieces for quality checks
+            joined = ", ".join(pieces) if len(pieces) > 1 else pieces[0]
+
+            if _is_decorative_text(joined):
+                continue
+            if len(joined.replace(" ", "").replace(",", "")) < 3:
+                continue
+
+            # Region shape: all tall regions = structural
+            row_reg_ids = {region_at[r][c] for c in range(num_cols) if grid[r][c] == key}
+            if all(regions[ri].height >= ANNOTATION_STRUCTURAL_HEIGHT for ri in row_reg_ids):
+                continue
+
+            seen_a.add(r)
+            label = _color_label(key)
+            results.append((r, joined, label))
+
+    # === SIGNAL B: column-disruption highlights ===
+    for r in range(num_rows):
+        if r in seen_a:
+            continue
+
+        # Default-bg runs that collectively span most of the row are content
+        # areas (shell prompts, hint text), not highlights.  Only short
+        # default-bg disruptions (selected menu items inside coloured panels)
+        # are interesting.
+        default_disruption_total = sum(
+            e - s + 1
+            for s, e, k in disruption_runs[r]
+            if k == _DEFAULT_BG
+        )
+        skip_default = default_disruption_total > num_cols // 2
+
+        for run_start, run_end, run_key in disruption_runs[r]:
+            run_width = run_end - run_start + 1
+            if run_width < 3:
+                continue
+            if run_key == _DEFAULT_BG and skip_default:
+                continue
+
+            # Require meaningful colour contrast with column dominants
+            col_doms = {col_dominant[c] for c in range(run_start, run_end + 1)}
+            min_contrast = min(
+                _color_distance(run_key, d)
+                for d in col_doms
+            )
+            if min_contrast < ANNOTATION_COL_DISRUPTION_DIST:
+                continue
+
+            # Extract text in this run
+            run_chars: list[str] = []
+            col_pos = 0
+            for seg_text, _seg_fg, seg_bg, _bold in all_rows[r]:
+                for ch in seg_text:
+                    if run_start <= col_pos <= run_end and seg_bg == run_key:
+                        run_chars.append(ch)
+                    col_pos += 1
+            text = "".join(run_chars).strip()
+
+            if _is_panel_chrome(text):
+                continue
+            if len(text.replace(" ", "")) < 3:
+                continue
+
+            # Region shape: cells in run must belong to short regions
+            run_reg_ids = {region_at[r][c] for c in range(run_start, run_end + 1)
+                           if grid[r][c] == run_key}
+            if not run_reg_ids:
+                continue
+            if max(regions[ri].height for ri in run_reg_ids) > ANNOTATION_MAX_DISRUPTION_HEIGHT:
+                continue
+
+            results.append((r, text, _color_label(run_key)))
+            break  # one result per row
+
+    # === SIGNAL C: high-frequency bg transitions (short flanked runs) ===
+    # A short run of one bg colour flanked by longer runs of a different bg
+    # is a spatial-frequency spike — typically a selected button, active tab,
+    # or focused element that stands out from its local surroundings.
+    # When a row has multiple qualifying runs of the same colour (e.g. a
+    # shortcut bar like mc's F-key row), they are combined into one annotation.
+    for r in range(num_rows):
+        # Build same-bg runs for this row
+        row_runs: list[tuple[int, int, tuple[int, int, int]]] = []
+        cur_key = grid[r][0]
+        run_s = 0
+        for c in range(1, num_cols):
+            if grid[r][c] != cur_key:
+                row_runs.append((run_s, c - 1, cur_key))
+                cur_key = grid[r][c]
+                run_s = c
+        row_runs.append((run_s, num_cols - 1, cur_key))
+
+        # Detect repeating bar pattern: >=6 runs alternating between exactly
+        # 2 colours (e.g. mc's F-key row: 2-wide black / 6-wide cyan x10).
+        # In this pattern the narrow separator runs are legitimate flanks so
+        # we skip the minimum-flank-width gate.
+        is_bar = False
+        if len(row_runs) >= 6:
+            bar_colors: set[tuple[int, int, int]] = set()
+            alternating = True
+            for bi in range(len(row_runs)):
+                bar_colors.add(row_runs[bi][2])
+                if bi > 0 and row_runs[bi][2] == row_runs[bi - 1][2]:
+                    alternating = False
+                    break
+            is_bar = alternating and len(bar_colors) == 2
+
+        # Collect all qualifying runs, grouped by bg colour.
+        hits: dict[tuple[int, int, int], list[str]] = defaultdict(list)
+        # For bar patterns, include edge runs (first/last) — they only
+        # have one neighbour but the repeating pattern is sufficient context.
+        scan_start = 0 if is_bar else 1
+        scan_end = len(row_runs) if is_bar else len(row_runs) - 1
+        for i in range(scan_start, scan_end):
+            s, e, k = row_runs[i]
+            width = e - s + 1
+            if width > 15:
+                continue
+            # Edge runs in bar mode: check the single neighbour only
+            if i == 0:
+                left_key = k  # no left neighbour — treat as same (skip check)
+                right_key = row_runs[i + 1][2]
+            elif i == len(row_runs) - 1:
+                left_key = row_runs[i - 1][2]
+                right_key = k  # no right neighbour
+            else:
+                left_key = row_runs[i - 1][2]
+                right_key = row_runs[i + 1][2]
+            if left_key == k and right_key == k:
+                continue
+            # For non-edge interior runs: both flanks must differ
+            if 0 < i < len(row_runs) - 1:
+                if left_key == k or right_key == k:
+                    continue
+            if not is_bar:
+                left_w = row_runs[i - 1][1] - row_runs[i - 1][0] + 1
+                right_w = row_runs[i + 1][1] - row_runs[i + 1][0] + 1
+                if left_w < 3 or right_w < 3:
+                    continue
+
+            # Require meaningful colour contrast with at least one neighbour
+            dist_left = _color_distance(k, left_key)
+            dist_right = _color_distance(k, right_key)
+            if max(dist_left, dist_right) < ANNOTATION_PROXIMITY_DIST:
+                continue
+
+            # Extract text in this run
+            col_pos = 0
+            run_chars: list[str] = []
+            for seg_text, _seg_fg, _seg_bg, _bold in all_rows[r]:
+                for ch in seg_text:
+                    if s <= col_pos <= e:
+                        run_chars.append(ch)
+                    col_pos += 1
+            text = "".join(run_chars).strip()
+            # In bar mode, single-char runs are meaningful (hotkey numbers);
+            # outside bar mode, require >=3 non-space chars to filter noise.
+            min_len = 1 if is_bar else 3
+            if len(text.replace(" ", "")) < min_len:
+                continue
+            if _is_decorative_text(text):
+                continue
+
+            hits[k].append(text)
+
+        # Emit one annotation per qualifying bg colour on this row.
+        for k, texts in hits.items():
+            combined = ", ".join(texts) if len(texts) > 1 else texts[0]
+            results.append((r, combined, _color_label(k)))
+
+    # --- Deduplicate: when multiple signals report the same (row, label),
+    # keep the entry with the longest text (richer context). ---
+    best: dict[tuple[int, str], tuple[int, str, str]] = {}
+    for entry in results:
+        row_num, text, label = entry
+        key = (row_num, label)
+        if key not in best or len(text) > len(best[key][1]):
+            best[key] = entry
+    results = sorted(best.values())
+    return results
+
+
+# ----------------------------
+# Transfer utilities
+# ----------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?(?:\x1b\\|\x07)")
+
+_B64_LINE_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from *text*."""
+    return _ANSI_RE.sub("", text)
+
+
+def _test_hooks_enabled() -> bool:
+    """Return True when internal transfer test hooks are enabled."""
+    return os.environ.get("TERM_CLI_TEST_HOOKS") == "1"
+
+
+def _inject_pipe_payload_fault(payload: str) -> str:
+    """Optionally mutate pipe-pane payload for deterministic test fault injection.
+
+    This is intentionally private and env-gated for tests.  No CLI flags/docs.
+
+    Supported when ``TERM_CLI_TEST_HOOKS=1``:
+    - ``TERM_CLI_TEST_PIPE_DROP_BLOCK=<start>:<count>``
+      Drops ``count`` base64 lines starting at 0-based index ``start``.
+    """
+    if not _test_hooks_enabled():
+        return payload
+
+    spec = os.environ.get("TERM_CLI_TEST_PIPE_DROP_BLOCK", "").strip()
+    if not spec:
+        return payload
+
+    try:
+        start_s, count_s = spec.split(":", 1)
+        start = int(start_s)
+        count = int(count_s)
+    except ValueError:
+        return payload
+
+    if start < 0 or count <= 0:
+        return payload
+
+    out_lines: list[str] = []
+    b64_idx = 0
+    end = start + count
+    for line in payload.splitlines():
+        if _B64_LINE_RE.match(line):
+            if start <= b64_idx < end:
+                b64_idx += 1
+                continue
+            b64_idx += 1
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def _format_size(nbytes: int) -> str:
+    """Human-readable file size."""
+    if nbytes < 1024:
+        return f"{nbytes}B"
+    if nbytes < 1024 * 1024:
+        return f"{nbytes / 1024:.1f}KB"
+    return f"{nbytes / (1024 * 1024):.1f}MB"
+
+
+# -- Python remote helper script --
+# Delivered to the remote via stdin to ``python3 -``.  Runs entirely in
+# the terminal's alternate screen buffer so no transfer noise is visible.
+# Uses only Python stdlib — no external dependencies.
+#
+# Protocol markers (printed to stdout, read by term-cli via screen capture):
+#   TC_READY            upload: receiver is ready for base64 payload
+#   TC_NOWRITE          upload: destination is not writable
+#   TC_DONE <sha256>    upload/download: operation completed, sha256 hex digest
+#   TC_DL_BEGIN         download (pipe-pane): base64 output starts
+#   TC_DL_END           download (pipe-pane): base64 output ends
+#   TC_CHK <n> <b>      download (pipe-pane): checkpoint (line count, byte count)
+#   TC_C <idx> / TC_E <idx>  download (chunked): chunk start/end with index
+#   TC_ERR <message>    any: error occurred
+
+_REMOTE_HELPER = r'''
+import sys, os, base64, gzip, hashlib, termios, tty
+
+_in_alt = False
+
+def _enter_alt():
+    global _in_alt
+    sys.stdout.write('\033[?1049h')
+    sys.stdout.flush()
+    _in_alt = True
+
+def _leave_alt():
+    global _in_alt
+    if _in_alt:
+        sys.stdout.write('\033[?1049l')
+        sys.stdout.flush()
+        _in_alt = False
+
+def _wait_for_dismiss():
+    """Block on alt-screen until the host (or a human) sends a dismiss key.
+
+    Accepted keys: q, Q, Ctrl-C (\\x03), Escape (\\x1b).
+    This keeps markers (TC_DONE, TC_ERR, etc.) visible on the alt-screen
+    so the host can reliably detect them before dismissing.
+    """
+    if not _in_alt:
+        return
+    fd = os.open('/dev/tty', os.O_RDONLY)
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch or ch in (b'q', b'Q', b'\x03', b'\x1b'):
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+
+def _die(msg):
+    if not _in_alt:
+        _enter_alt()
+    sys.stdout.write('TC_ERR ' + msg + '\n')
+    sys.stdout.flush()
+    _wait_for_dismiss()
+    _leave_alt()
+    sys.exit(1)
+
+def _read_tty_bytes(n):
+    """Read exactly *n* bytes from /dev/tty in raw mode."""
+    fd = os.open('/dev/tty', os.O_RDONLY)
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = os.read(fd, min(n - len(buf), 65536))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+    return bytes(buf)
+
+def cmd_upload(dest, b64_len):
+    """Receive base64 payload via /dev/tty, decode, decompress, write to dest."""
+    _enter_alt()
+    # Track whether the file existed before so we only clean up our own mess
+    existed = os.path.exists(dest)
+    # Trial write — fail before signalling ready
+    try:
+        with open(dest, 'ab') as f:
+            pass
+    except (OSError, IOError):
+        sys.stdout.write('TC_NOWRITE\n')
+        sys.stdout.flush()
+        _wait_for_dismiss()
+        return
+
+    def _cleanup():
+        if not existed:
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+
+    sys.stdout.write('TC_READY\n')
+    sys.stdout.flush()
+
+    raw_b64 = _read_tty_bytes(b64_len)
+
+    if len(raw_b64) != b64_len:
+        _cleanup()
+        _die('incomplete payload: expected %d got %d' % (b64_len, len(raw_b64)))
+
+    try:
+        decoded = base64.b64decode(raw_b64)
+    except Exception as e:
+        _cleanup()
+        _die('base64 decode failed: ' + str(e))
+
+    try:
+        decoded = gzip.decompress(decoded)
+    except Exception as e:
+        _cleanup()
+        _die('gzip decompress failed: ' + str(e))
+
+    try:
+        tmp_dest = dest + '.term-cli.tmp'
+        with open(tmp_dest, 'wb') as f:
+            f.write(decoded)
+        os.rename(tmp_dest, dest)
+    except (OSError, IOError) as e:
+        # Clean up temp file if rename failed
+        try:
+            os.unlink(tmp_dest)
+        except OSError:
+            pass
+        _cleanup()
+        _die('write failed: ' + str(e))
+
+    sha = hashlib.sha256(decoded).hexdigest()
+    sys.stdout.write('TC_DONE ' + sha + '\n')
+    sys.stdout.flush()
+    _wait_for_dismiss()
+
+def cmd_download_pipe(src, checkpoint_lines):
+    """Download via stdout (for pipe-pane capture).  Outputs framed base64."""
+    _enter_alt()
+    try:
+        data = open(src, 'rb').read()
+    except (OSError, IOError) as e:
+        _die('read failed: ' + str(e))
+
+    sha = hashlib.sha256(data).hexdigest()
+
+    data = gzip.compress(data, compresslevel=6)
+
+    b64 = base64.encodebytes(data).decode('ascii')
+    # Normalise to 76-char lines (base64.encodebytes uses 76 already, but be safe)
+    raw_lines = []
+    for line in b64.splitlines():
+        line = line.strip()
+        if line:
+            raw_lines.append(line)
+    # Re-wrap to exactly 76 chars per line
+    joined = ''.join(raw_lines)
+    lines = [joined[i:i+76] for i in range(0, len(joined), 76)]
+
+    sys.stdout.write('TC_DL_BEGIN\n')
+    n = checkpoint_lines
+    line_count = 0
+    byte_count = 0
+    for line in lines:
+        sys.stdout.write(line + '\n')
+        line_count += 1
+        byte_count += len(line)
+        if line_count % n == 0:
+            sys.stdout.write('TC_CHK %d %d\n' % (line_count, byte_count))
+    sys.stdout.write('TC_CHK %d %d\n' % (line_count, byte_count))
+    sys.stdout.write('TC_DL_END\n')
+    sys.stdout.write('TC_DONE ' + sha + '\n')
+    sys.stdout.flush()
+
+def _wait_for_ack():
+    """Block until the host sends an ack key (n/N) or dismiss (q/Q/Ctrl-C/Esc).
+
+    Returns True for ack (continue), False for dismiss (stop).
+    """
+    fd = os.open('/dev/tty', os.O_RDONLY)
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch or ch in (b'q', b'Q', b'\x03', b'\x1b'):
+                return False
+            if ch in (b'n', b'N'):
+                return True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+
+def cmd_download_chunked(src, chunk_size):
+    """Download via chunked screen capture with ack protocol.
+
+    Stays on alt-screen throughout.  Writes TC_DL_INFO, then iterates
+    chunks with TC_C/TC_E delimiters, waiting for ack between each.
+    Uses dismiss pattern at the end.
+    """
+    _enter_alt()
+    try:
+        raw_data = open(src, 'rb').read()
+    except (OSError, IOError) as e:
+        _die('read failed: ' + str(e))
+
+    sha = hashlib.sha256(raw_data).hexdigest()
+
+    data = gzip.compress(raw_data, compresslevel=6)
+
+    b64 = base64.encodebytes(data).decode('ascii')
+    raw_lines = []
+    for line in b64.splitlines():
+        line = line.strip()
+        if line:
+            raw_lines.append(line)
+    joined = ''.join(raw_lines)
+    lines = [joined[i:i+76] for i in range(0, len(joined), 76)]
+    total_lines = len(lines)
+
+    # Report info and wait for ack to start chunking
+    sys.stdout.write('\033[2J\033[H')
+    sys.stdout.write('TC_DL_INFO %d %s\n' % (total_lines, sha))
+    sys.stdout.flush()
+    if not _wait_for_ack():
+        return
+
+    offset = 0
+    chunk_idx = 0
+    while offset < total_lines:
+        count = min(chunk_size, total_lines - offset)
+        chunk = lines[offset:offset+count]
+        sys.stdout.write('\033[2J\033[H')
+        sys.stdout.write('TC_C %d\n' % chunk_idx)
+        for line in chunk:
+            sys.stdout.write(line + '\n')
+        sys.stdout.write('TC_E %d\n' % chunk_idx)
+        sys.stdout.flush()
+        offset += count
+        chunk_idx += 1
+        if offset < total_lines:
+            if not _wait_for_ack():
+                return
+        # After last chunk, fall through to TC_DONE
+
+    sys.stdout.write('TC_DONE ' + sha + '\n')
+    sys.stdout.flush()
+    _wait_for_dismiss()
+
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    if not args:
+        _die('usage: upload|download_pipe|download_chunked ...')
+
+    cmd = args[0]
+    try:
+        if cmd == 'upload':
+            # upload <dest> <b64_len>
+            dest = args[1]
+            b64_len = int(args[2])
+            cmd_upload(dest, b64_len)
+        elif cmd == 'download_pipe':
+            # download_pipe <src> <checkpoint_lines>
+            src = args[1]
+            cp = int(args[2])
+            cmd_download_pipe(src, cp)
+        elif cmd == 'download_chunked':
+            # download_chunked <src> <chunk_size>
+            src = args[1]
+            chunk_size = int(args[2])
+            cmd_download_chunked(src, chunk_size)
+        else:
+            _die('unknown command: ' + cmd)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _die(str(e))
+    finally:
+        _leave_alt()
+'''.lstrip()
+
+# Pre-computed compressed + base64 encoding of _REMOTE_HELPER.
+# Used by _run_helper() to deliver the script in a single shell command
+# via ``python3 -c 'exec(gzip.decompress(base64.b64decode("...")).decode())'``.
+_REMOTE_HELPER_B64: str = base64.b64encode(
+    gzip.compress(_REMOTE_HELPER.encode(), compresslevel=9)
+).decode()
+
+
+def _load_and_paste(session: str, data: str, *, bracketed: bool = False) -> None:
+    """Load data into tmux paste buffer, then paste into session pane.
+
+    Uses tmux load-buffer + paste-buffer (same mechanism as send-stdin).
+
+    When *bracketed* is True, uses ``paste-buffer -p`` which wraps the
+    pasted content in bracketed-paste escape sequences (``\\e[200~`` /
+    ``\\e[201~``).  Modern shells (zsh, bash 4.4+, fish) recognise these
+    and treat the entire paste as a single input block — no line-editor
+    wrapping or continuation prompts — which is essential for pasting the
+    ~2.5 KB bootstrap command on narrow (80-column) terminals.
+
+    Bracketed paste must **not** be used when pasting raw data into a
+    program that reads from ``/dev/tty`` in raw mode (e.g. the upload
+    helper), because the escape-sequence wrapper bytes would corrupt the
+    payload.
+    """
+    tmux = _tmux_path()
+    tmux_args = [tmux]
+    if _tmux_socket:
+        tmux_args.extend(["-L", _tmux_socket])
+    tmux_args.extend(["load-buffer", "-"])
+    proc = subprocess.run(
+        tmux_args,
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "Failed to load buffer")
+
+    paste_cmd: list[str] = ["paste-buffer"]
+    if bracketed:
+        paste_cmd.append("-p")
+    paste_cmd.extend(["-t", _exact(session)])
+    res = _run_tmux(paste_cmd)
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to paste buffer")
+
+    _run_tmux(["delete-buffer"])
+
+
+def _send_cmd(session: str, cmd: str) -> None:
+    """Send a command string + Enter to the session pane.
+
+    A leading space is prepended so that shells with HISTCONTROL=ignorespace
+    (the common default) do not record transfer-internal commands in history.
+    """
+    res = _run_tmux(["send-keys", "-t", _exact(session), "--", " " + cmd])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send command")
+    res2 = _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
+    if not res2.ok:
+        raise RuntimeError(res2.stderr.strip() or "Failed to send Enter")
+
+
+def _remote_exec(session: str, cmd: str, timeout: float) -> str:
+    """Run *cmd* in session, wait for prompt, return captured screen text.
+
+    The caller is responsible for ensuring the session is at a prompt before
+    calling this function.  On timeout, raises OperationTimeout.
+    """
+    _send_cmd(session, cmd)
+    time.sleep(0.1)
+    success, _ = _wait_for_prompt(session, timeout)
+    if not success:
+        raise OperationTimeout(f"remote command did not complete within {timeout}s: {cmd}")
+    return _capture_screen(session, trim=True, join_wrapped=True)
+
+
+def _remote_exec_until_marker(
+    session: str,
+    cmd: str,
+    done_marker: str,
+    timeout: float,
+) -> str:
+    """Run *cmd*, wait for *done_marker* and prompt, then capture screen.
+
+    This is more deterministic than prompt-only waits for short probe commands
+    in nested tmux/SSH sessions where prompt detection can briefly match stale
+    state before the command output is fully rendered.
+    """
+    start = time.time()
+    _send_cmd(session, cmd)
+
+    matched, _ = _wait_for_any_text(session, [done_marker], timeout)
+    if matched is None:
+        raise OperationTimeout(
+            f"remote command marker not seen within {timeout}s: {done_marker}"
+        )
+
+    elapsed = time.time() - start
+    remaining = max(0.1, timeout - elapsed)
+    success, _ = _wait_for_prompt(session, remaining)
+    if not success:
+        raise OperationTimeout(f"remote command did not complete within {timeout}s: {cmd}")
+
+    return _capture_screen(session, trim=True, join_wrapped=True)
+
+
+def _dismiss_helper(session: str) -> None:
+    """Send 'q' to dismiss a remote helper blocking on _wait_for_dismiss().
+
+    After the helper receives 'q', it leaves alt-screen and exits, allowing
+    the shell prompt to return.  A short sleep gives it time to process.
+    """
+    _run_tmux(["send-keys", "-t", _exact(session), "q"])
+    time.sleep(0.3)
+
+
+def _get_erase_lines(session: str) -> int:
+    """Read the stored erase-line count from the tmux session option.
+
+    Returns the number of physical lines that the ``_enter_alt_echo_off``
+    command occupied on the normal screen.  Falls back to 1 if the option
+    is missing (defensive).
+    """
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_ERASE_LINES_OPT])
+    if res.ok and res.stdout.strip():
+        try:
+            return max(1, int(res.stdout.strip()))
+        except ValueError:
+            pass
+    return 1
+
+
+def _build_erase_seq(n: int) -> str:
+    r"""Build an escape sequence that exits alt-screen and erases *n* lines.
+
+    After ``\033[?1049l`` restores the normal screen, the cursor is on the
+    line immediately below the echoed command text (bash echoed the command +
+    newline, then executed the pipeline which entered alt-screen).
+
+    The sequence:
+    1. ``\033[?1049l`` — leave alt-screen, restore normal screen + cursor.
+    2. ``\033[2K`` — erase the current line (the blank line after the
+       echoed command).
+    3. (``\033[A\033[2K``) × *n* — move up and erase each line of the
+       echoed command text.
+    4. ``\033[G`` — move cursor to column 1.
+    """
+    seq = r"\033[?1049l\033[2K"
+    seq += r"\033[A\033[2K" * n
+    seq += r"\033[G"
+    return seq
+
+
+def _restore_terminal(session: str) -> None:
+    """Best-effort: interrupt running process, exit alternate screen, restore echo.
+
+    Called in except/finally blocks to ensure the terminal is usable after a
+    failed or interrupted transfer.
+
+    If the helper was already dismissed cleanly (the bootstrap suffix restored
+    echo and HISTCONTROL, and we're back on normal screen at a prompt), this
+    function detects that and skips sending any commands — avoiding visible
+    cleanup artifacts and cursor corruption on the normal screen.
+
+    When cleanup IS needed (helper crashed, timeout, still on alt-screen):
+
+    Order matters:
+    1. Interrupt first (C-c twice) — kills any running helper that may be
+       reading from /dev/tty.  If we sent shell commands *before* C-c,
+       the running helper would consume them as payload data.
+    2. Clear line editor (kill any partially-typed command).
+    3. Single combined command: exit alt-screen (with cursor-up + erase to
+       clean the echoed setup command), restore echo and HISTCONTROL.
+    """
+    try:
+        # Check if cleanup is needed: if we're on normal screen and at a
+        # prompt, the helper exited cleanly and the bootstrap suffix already
+        # restored everything.
+        res = _run_tmux(
+            ["display-message", "-t", _exact(session), "-p", "#{alternate_on}"]
+        )
+        on_alt = res.ok and res.stdout.strip() == "1"
+
+        if not on_alt and _is_at_prompt(session):
+            # Terminal is already clean — nothing to do.
+            return
+
+        # 1. Interrupt twice (handles nested processes)
+        _run_tmux(["send-keys", "-t", _exact(session), "C-c"])
+        time.sleep(0.1)
+        _run_tmux(["send-keys", "-t", _exact(session), "C-c"])
+        time.sleep(0.2)
+        # 2. Clear line editor (kill any partially-typed command)
+        _run_tmux(["send-keys", "-t", _exact(session), "C-u"])
+        time.sleep(0.05)
+        # 3. Combined cleanup in a single command (= single Enter = single prompt).
+        # - Exit alt-screen, erase exactly the lines the setup command
+        #   occupied (computed by _enter_alt_echo_off, stored in tmux opt).
+        # - Restore echo and restore original HISTCONTROL value.
+        # The alt-screen exit is a no-op if already on normal screen.
+        erase_n = _get_erase_lines(session)
+        erase_seq = _build_erase_seq(erase_n)
+        _send_cmd(
+            session,
+            f"printf '{erase_seq}'; stty echo 2>/dev/null; HISTCONTROL=\"${{_TCH-}}\"; unset _TCH 2>/dev/null",
+        )
+        # Don't wait long — this is best-effort cleanup
+        _wait_for_prompt(session, 3.0)
+    except Exception:
+        pass  # Best-effort — never mask the original exception
+
+
+def _require_prompt_ready(session: str) -> None:
+    """Verify the session is at a clean shell prompt, ready for transfer commands.
+
+    Raises ValueError if the shell is not at a prompt (a command is running,
+    a TUI is active, or there's partial input on the command line).
+
+    Note: we intentionally do NOT check ``#{alternate_on}`` because nested
+    tmux sessions legitimately report alt-screen even when the inner shell
+    is idle at a prompt.  The prompt-detection heuristic handles TUIs
+    correctly — when a TUI (vim, htop, less) is in the foreground, the
+    cursor won't be at a recognisable prompt.
+    """
+    if not _is_at_prompt(session):
+        raise ValueError(
+            "Session shell is not at a prompt — a command may be running, "
+            "a TUI may be active, or there is partial input on the command line. "
+            "Wait for the command to finish or clear any partial input (Ctrl-C) "
+            "before attempting file transfers."
+        )
+
+
+def _enter_alt_echo_off(session: str) -> None:
+    """Save HISTCONTROL, enable ignorespace, disable echo, enter alt-screen.
+
+    Sends a single combined command that:
+    1. Saves the original ``HISTCONTROL`` value in ``_TCH``.
+    2. Sets ``HISTCONTROL=ignorespace`` so subsequent commands prefixed
+       with a space (which ``_send_cmd`` always does) are not recorded.
+    3. Disables echo (``stty -echo``).
+    4. Enters alternate screen (``printf '\\033[?1049h'``).
+
+    Before sending the command, queries the cursor position and terminal
+    width to compute how many physical lines the echoed command text will
+    occupy.  This count is stored in a tmux session option so that
+    ``_run_helper`` and ``_restore_terminal`` can erase exactly the right
+    number of lines when leaving alt-screen.
+
+    This combined command is itself recorded in history (``HISTCONTROL``
+    hasn't taken effect yet when bash reads it), but it's a short setup
+    line.  All subsequent commands — probes, the python3 bootstrap
+    one-liner — are suppressed because ``_send_cmd`` prepends a space.
+
+    The original ``HISTCONTROL`` value is restored by the bootstrap's
+    suffix or by ``_restore_terminal()`` on error paths.
+
+    The echoed command text on the normal screen is cleaned up later by
+    ``_run_helper``'s bootstrap prefix (cursor-up + erase).
+    """
+    cmd = r"""_TCH="${HISTCONTROL-}"; HISTCONTROL=ignorespace; stty -echo; printf '\033[?1049h'"""
+
+    # Compute how many physical lines the echoed command will occupy.
+    # _send_cmd prepends a space, so the echoed text is " " + cmd.
+    # The shell echoes this starting at cursor_x (the prompt width).
+    cursor_pos = _get_cursor_position(session)
+    pane_w, _ = _get_pane_dimensions(session)
+    cursor_x = cursor_pos[0] if cursor_pos else 0
+    visible_chars = cursor_x + 1 + len(cmd)  # prompt + space + cmd
+    erase_lines = (visible_chars + pane_w - 1) // pane_w
+
+    # Store for _run_helper / _restore_terminal to use.
+    _run_tmux([
+        "set-option", "-t", _exact(session),
+        TERM_CLI_ERASE_LINES_OPT, str(erase_lines),
+    ])
+
+    _send_cmd(session, cmd)
+    ok, _ = _wait_for_prompt(session, 5.0)
+    if not ok:
+        raise RuntimeError(
+            "Timed out waiting for alt-screen prompt after stty -echo"
+        )
+
+
+def _hide_probe_start(session: str) -> None:
+    """Disable echo/history and enter alt-screen so probes run invisibly.
+
+    Probes (``_probe_python``, ``_remote_file_exists``) run on the
+    alt-screen so their output is invisible on the normal screen.
+
+    The shell echoes the setup command onto the normal screen (on the
+    current prompt line) before executing it, so the saved normal-screen
+    snapshot contains that text.  This is cleaned up later by
+    ``_run_helper(already_on_alt=True)`` which, upon leaving alt-screen,
+    erases exactly the lines the echoed command occupied (computed
+    dynamically from prompt width and terminal width).
+
+    ``_restore_terminal()`` handles cleanup on crash (exits alt-screen,
+    restores echo, restores HISTCONTROL).
+    """
+    _enter_alt_echo_off(session)
+
+
+def _probe_python(session: str, timeout: float) -> str:
+    """Detect whether ``python3`` or ``python`` is available on the remote.
+
+    Returns the binary name (``"python3"`` or ``"python"``).
+    Raises RuntimeError if neither is found.
+    """
+    probe_id = f"{os.getpid()}_{int(time.time() * 1000) & 0xFFFFFF}"
+    done_marker = f"TC_PY_DONE_{probe_id}"
+    cmd = (
+        f"python3 -c \"print('TC_PY3_{probe_id}_OK'); print('TC_PY3_{probe_id}_OK')\" 2>/dev/null; "
+        f"python -c \"import sys; print('TC_PYBIN_{probe_id}_%d' % sys.version_info[0]); "
+        f"print('TC_PYBIN_{probe_id}_%d' % sys.version_info[0])\" 2>/dev/null; "
+        f"printf '{done_marker}\\n'"
+    )
+    screen = _remote_exec_until_marker(session, cmd, done_marker, timeout)
+
+    py3_re = re.compile(
+        rf"(?:^|\s)TC_PY3_{re.escape(probe_id)}_OK(?:\s|$)",
+        re.MULTILINE,
+    )
+    if py3_re.search(screen):
+        return "python3"
+
+    m = re.search(
+        rf"(?:^|\s)TC_PYBIN_{re.escape(probe_id)}_(\d+)(?:\s|$)",
+        screen,
+        re.MULTILINE,
+    )
+    if m and m.group(1) == "3":
+        return "python"
+
+    raise RuntimeError(
+        "Python 3 is not available on the remote host.  "
+        "Install python3 to enable file transfers."
+    )
+
+
+def _run_helper(
+    session: str,
+    python_bin: str,
+    helper_args: str,
+    already_on_alt: bool = False,
+) -> None:
+    """Deploy and execute the Python remote helper in the terminal.
+
+    The helper script is delivered as a single shell command using a
+    compressed + base64-encoded payload (~2.4 KB) executed via
+    ``python3 -c 'exec(gzip.decompress(base64.b64decode("...")).decode())'``.
+
+    This avoids the heredoc/paste approach entirely — no multi-line paste,
+    no tmux buffer size issues, no tty-vs-pipe stdin complications.
+
+    The helper script itself manages alternate-screen enter/exit internally
+    (``_enter_alt()`` / ``_leave_alt()``).  If the helper crashes before
+    entering alt-screen, ``_restore_terminal()`` handles cleanup.
+
+    The terminal is always on alt-screen (with echo off) when the bootstrap
+    is pasted — either because the caller already set this up via
+    ``_hide_probe_start`` (*already_on_alt=True*) or because this function
+    does it itself.
+
+    The bootstrap is prefixed with a ``printf`` that leaves alt-screen,
+    erases exactly the lines the echoed setup command occupied (computed
+    by ``_enter_alt_echo_off`` and stored in a tmux session option), and
+    moves the cursor to column 1.  The helper's ``_enter_alt()``
+    then saves the cleaned normal screen.  Because alt-exit and alt-enter
+    happen within the same shell command, no PS1 is printed on the restored
+    screen.
+    """
+    if not already_on_alt:
+        # Enter alt-screen with echo off and history disabled,
+        # same as _hide_probe_start.
+        # This ensures the bootstrap paste and its echo are invisible,
+        # and the alt-exit prefix in the bootstrap can erase the echoed
+        # command line (the set/stty/printf text).
+        _enter_alt_echo_off(session)
+
+    # Send the single-line bootstrap command via paste buffer.
+    # The command is ~2.5KB, which exceeds typical 80-column terminals.
+    # Using send-keys would cause the shell's line editor to wrap the text,
+    # inserting continuation prompts into the command and corrupting it.
+    # Paste-buffer injects text directly into the terminal input, bypassing
+    # the line editor's wrapping logic.
+    # The helper args (upload/download/etc.) are passed as regular shell args
+    # to python3, which populates sys.argv = ['-c', 'upload', ...].
+    # The helper reads sys.argv[1:] for its command dispatch.
+
+    # We're on alt-screen.  Prepend a printf that leaves alt-screen to
+    # restore the normal screen, erases the echoed commands, and moves
+    # the cursor to column 1.
+    #
+    # The erase count was computed by _enter_alt_echo_off based on the
+    # actual cursor position (prompt width) and terminal width, so it
+    # erases exactly the lines occupied by the echoed command — no more.
+    erase_n = _get_erase_lines(session)
+    erase_seq = _build_erase_seq(erase_n)
+    alt_exit = f"printf '{erase_seq}'; "
+    bootstrap = (
+        f" {alt_exit}{python_bin} -c "
+        f"'import base64,gzip;exec(gzip.decompress(base64.b64decode("
+        f'"{_REMOTE_HELPER_B64}"'
+        f")).decode())' "
+        f"{helper_args} || true; "
+        f'stty echo; HISTCONTROL="${{_TCH-}}"; unset _TCH'
+    )
+    _load_and_paste(session, bootstrap, bracketed=True)
+    _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
+
+
+def _remote_file_exists(session: str, path: str, timeout: float) -> bool:
+    """Check if a file exists in the session's shell.
+
+    Uses ``test -f`` with a unique per-invocation marker to avoid false
+    positives from stale output still visible on the terminal screen.
+    """
+    marker = f"{os.getpid()}_{int(time.time() * 1000) & 0xFFFFFF}"
+    done_marker = f"TC_FE_DONE_{marker}"
+    cmd = (
+        f"test -f {shlex.quote(path)}; rc=$?; "
+        f"printf 'TC_FE_{marker}_%d\\nTC_FE_{marker}_%d\\n' \"$rc\" \"$rc\"; "
+        f"printf '{done_marker}\\n'"
+    )
+    screen = _remote_exec_until_marker(session, cmd, done_marker, timeout)
+    m = re.search(
+        rf"(?:^|\s)TC_FE_{re.escape(marker)}_([01])\s*$",
+        screen,
+        re.MULTILINE,
+    )
+    return bool(m and m.group(1) == "0")
+
+
+def _get_dl_strategy(session: str) -> str | None:
+    """Read remembered download strategy for this session."""
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_DL_STRATEGY_OPT])
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip()
+    return None
+
+
+def _set_dl_strategy(session: str, strategy: str) -> None:
+    """Remember download strategy for this session."""
+    _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_DL_STRATEGY_OPT, strategy])
+
+
+def _download_pipe(
+    session: str,
+    remote_path: str,
+    local_tmp: str,
+    python_bin: str,
+    timeout: float,
+    verbose: bool,
+    already_on_alt: bool = False,
+) -> tuple[bytes, str] | None:
+    """Download via pipe-pane (fast path). Returns (decoded_bytes, sha256) or None.
+
+    Deploys the Python remote helper with ``download_pipe`` command.  The
+    helper outputs TC_DL_BEGIN, base64 lines with TC_CHK checkpoints,
+    TC_DL_END, and TC_DONE <sha256>.  pipe-pane captures the raw PTY
+    stream (works even though the helper runs in alt-screen).
+
+    Data is always gzip-compressed during transfer.
+
+    Returns None on corruption so the caller can fall back to chunked.
+    """
+    remote_quoted = shlex.quote(remote_path)
+
+    # Ensure no existing pipe
+    _run_tmux(["pipe-pane", "-t", _exact(session)])
+    time.sleep(0.05)
+
+    # Start pipe-pane writing to local temp file
+    shell_cmd = f"cat > {shlex.quote(local_tmp)}"
+    res = _run_tmux(["pipe-pane", "-O", "-o", "-t", _exact(session), shell_cmd])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to start pipe-pane")
+
+    try:
+        # Deploy Python helper with download_pipe command
+        helper_args = f"download_pipe {remote_quoted} {PIPE_CHECKPOINT_LINES}"
+        _run_helper(session, python_bin, helper_args, already_on_alt=already_on_alt)
+
+        # Wait for prompt to return (helper finished, alt-screen exited)
+        time.sleep(0.2)
+        success, _ = _wait_for_prompt(session, timeout)
+        if not success:
+            raise OperationTimeout(f"download (pipe) did not complete within {timeout}s")
+    finally:
+        # Always stop pipe-pane
+        _run_tmux(["pipe-pane", "-t", _exact(session)])
+        time.sleep(0.1)
+
+    # Read captured output
+    try:
+        with open(local_tmp, "r") as f:
+            raw = f.read()
+    finally:
+        try:
+            os.unlink(local_tmp)
+        except OSError:
+            pass
+
+    # Strip ANSI escapes that may leak from the terminal
+    raw = _strip_ansi(raw)
+
+    # Parse between delimiters
+    begin_idx = raw.find("TC_DL_BEGIN\n")
+    end_idx = raw.find("TC_DL_END\n")
+    if begin_idx < 0 or end_idx < 0 or end_idx <= begin_idx:
+        if verbose:
+            _eprint("pipe-pane: delimiters not found, falling back")
+        return None
+
+    payload = raw[begin_idx + len("TC_DL_BEGIN\n"):end_idx]
+    payload = _inject_pipe_payload_fault(payload)
+
+    # Extract TC_DONE sha256 from after TC_DL_END
+    remote_sha: str | None = None
+    after_end = raw[end_idx:]
+    for line in after_end.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TC_DONE "):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                remote_sha = parts[1]
+            break
+
+    # Check for TC_ERR
+    if "TC_ERR " in raw:
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("TC_ERR "):
+                if verbose:
+                    _eprint(f"pipe-pane: remote error: {stripped[7:]}")
+                return None
+
+    # Valid base64 chars (lines are [A-Za-z0-9+/=]+), checkpoint lines
+    # start with "TC_CHK ".  Anything else is noise.
+
+    # Validate checkpoints and extract data lines
+    data_lines: list[str] = []
+    cumulative_bytes = 0
+    line_count = 0
+    for line in payload.splitlines():
+        if line.startswith("TC_CHK "):
+            parts = line.split()
+            if len(parts) != 3:
+                if verbose:
+                    _eprint(f"pipe-pane: malformed checkpoint: {line}")
+                return None
+            try:
+                expected_lines = int(parts[1])
+                expected_bytes = int(parts[2])
+            except ValueError:
+                if verbose:
+                    _eprint(f"pipe-pane: bad checkpoint values: {line}")
+                return None
+            if expected_lines != line_count or expected_bytes != cumulative_bytes:
+                if verbose:
+                    _eprint(
+                        f"pipe-pane: checkpoint mismatch at line {line_count}: "
+                        f"expected ({expected_lines}, {expected_bytes}), "
+                        f"got ({line_count}, {cumulative_bytes})"
+                    )
+                return None
+        elif _B64_LINE_RE.match(line):
+            data_lines.append(line)
+            line_count += 1
+            cumulative_bytes += len(line)
+        # else: noise line — skip silently
+
+    b64_data = "\n".join(data_lines)
+    try:
+        decoded = base64.b64decode(b64_data)
+    except Exception:
+        if verbose:
+            _eprint("pipe-pane: base64 decode failed, falling back")
+        return None
+
+    try:
+        decoded = gzip.decompress(decoded)
+    except Exception:
+        if verbose:
+            _eprint("pipe-pane: gzip decompress failed, falling back")
+        return None
+
+    # Use remote_sha if available, otherwise return empty string
+    return (decoded, remote_sha or "")
+
+
+def _download_chunked(
+    session: str,
+    remote_path: str,
+    python_bin: str,
+    timeout: float,
+    verbose: bool,
+    already_on_alt: bool = False,
+) -> tuple[bytes, str]:
+    """Download via chunked screen capture (safe fallback).
+
+    Deploys a single long-running helper that stays on alt-screen throughout.
+    The helper reports TC_DL_INFO (total lines + sha256), then iterates
+    chunks delimited by TC_C/TC_E, waiting for an ack key ('n') between
+    each.  After the last chunk it writes TC_DONE and waits for dismiss
+    ('q').
+
+    Data is always gzip-compressed during transfer.
+
+    Returns (decoded_bytes, sha256_hex).
+    """
+    remote_quoted = shlex.quote(remote_path)
+
+    # Determine chunk size based on terminal height.
+    _, pane_height = _get_pane_dimensions(session)
+    # Leave margin for TC_C, TC_E, and cursor positioning.
+    usable_lines = max(pane_height - 6, 4)
+
+    # Deploy helper — single invocation for the entire chunked download.
+    helper_args = f"download_chunked {remote_quoted} {usable_lines}"
+    _run_helper(session, python_bin, helper_args, already_on_alt=already_on_alt)
+
+    # Wait for TC_DL_INFO (helper writes to alt-screen)
+    info_marker, _ = _wait_for_any_text(
+        session, ["TC_DL_INFO", "TC_ERR"], timeout=timeout,
+    )
+    if info_marker == "TC_ERR":
+        screen = _capture_screen(session, trim=True)
+        err_msg = "Remote helper reported an error"
+        m = re.search(r"TC_ERR\s+(.+)", screen)
+        if m:
+            err_msg = m.group(1).strip()
+        _dismiss_helper(session)
+        _wait_for_prompt(session, 5.0)
+        raise RuntimeError(err_msg)
+    if info_marker is None:
+        raise OperationTimeout("download_info did not complete within timeout")
+
+    # Use regex to handle line wrapping on narrow terminals.
+    screen = _capture_screen(session, trim=True)
+    m = re.search(r"TC_DL_INFO\s+(\d+)\s+([0-9a-f]{64})", screen)
+    if not m:
+        # Parsing failure is not an empty file; treat as corruption so callers
+        # can surface/fallback instead of silently returning b"".
+        raise RuntimeError("chunked download: could not parse TC_DL_INFO marker")
+    total_b64_lines = int(m.group(1))
+    remote_sha = m.group(2)
+
+    if total_b64_lines == 0:
+        # Empty file — dismiss helper and return
+        _dismiss_helper(session)
+        _wait_for_prompt(session, timeout)
+        return (b"", remote_sha)
+
+    if verbose:
+        _eprint(f"Total base64 lines: {total_b64_lines}")
+
+    accumulated: list[str] = []
+    offset = 0
+    chunk_idx = 0
+
+    while offset < total_b64_lines:
+        count = min(usable_lines, total_b64_lines - offset)
+
+        # Send ack to request next chunk
+        _run_tmux(["send-keys", "-t", _exact(session), "n"])
+
+        # Wait for TC_E <chunk_idx> (end of chunk) on alt-screen.
+        # Including the chunk index avoids matching a stale TC_E from
+        # the previous chunk that hasn't been cleared yet.
+        tc_e_marker = f"TC_E {chunk_idx}"
+        chunk_end_ok, _ = _wait_for_text(session, tc_e_marker, timeout=timeout)
+        if not chunk_end_ok:
+            # Check for remote error before raising generic timeout
+            screen = _capture_screen(session, trim=True)
+            m = re.search(r"TC_ERR\s+(.+)", screen)
+            if m:
+                _dismiss_helper(session)
+                _wait_for_prompt(session, 5.0)
+                raise RuntimeError(m.group(1).strip())
+            raise OperationTimeout(
+                f"chunked download stalled at offset {offset}/{total_b64_lines}"
+            )
+
+        # Capture alt-screen and extract data between TC_C and TC_E
+        screen = _capture_screen(session, trim=True, join_wrapped=False)
+        lines = screen.splitlines()
+
+        tc_c_marker = f"TC_C {chunk_idx}"
+        in_data = False
+        chunk_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped == tc_e_marker:
+                break
+            if in_data and stripped:
+                if _B64_LINE_RE.match(stripped):
+                    chunk_lines.append(stripped)
+                # else: noise line — skip silently
+            if stripped == tc_c_marker:
+                in_data = True
+
+        accumulated.extend(chunk_lines)
+        if verbose and len(chunk_lines) != count:
+            _eprint(
+                f"  chunked: expected {count} lines in chunk {chunk_idx}, "
+                f"got {len(chunk_lines)} (hash check will catch corruption)"
+            )
+        offset += count
+        chunk_idx += 1
+
+        if verbose:
+            pct = min(100, int(offset / total_b64_lines * 100))
+            prev_pct = min(100, int((offset - count) / total_b64_lines * 100))
+            if pct // 10 != prev_pct // 10 or offset >= total_b64_lines:
+                _eprint(f"  chunked: {pct}% ({offset}/{total_b64_lines} lines)")
+
+    # Wait for TC_DONE after last chunk
+    done_ok, _ = _wait_for_text(session, "TC_DONE", timeout=timeout)
+    if not done_ok:
+        raise OperationTimeout("chunked download: TC_DONE not received")
+
+    # Parse TC_DONE to get sha (may differ from TC_DL_INFO if file changed).
+    # Use regex to handle line wrapping on narrow terminals.
+    screen = _capture_screen(session, trim=True)
+    m = re.search(r"TC_DONE\s+([0-9a-f]{64})", screen)
+    if m:
+        remote_sha = m.group(1)
+
+    # Dismiss helper and wait for prompt
+    _dismiss_helper(session)
+    _wait_for_prompt(session, timeout)
+
+    b64_data = "\n".join(accumulated)
+    try:
+        decoded = base64.b64decode(b64_data)
+    except Exception as e:
+        raise RuntimeError(f"base64 decode failed after chunked download: {e}")
+
+    try:
+        decoded = gzip.decompress(decoded)
+    except Exception as e:
+        raise RuntimeError(f"gzip decompress failed after chunked download: {e}")
+
+
+    return (decoded, remote_sha)
+
+
+# ----------------------------
+# Commands
+# ----------------------------
+
+def cmd_list(args: argparse.Namespace) -> None:
+    res = _run_tmux(["list-sessions", "-F", "#{session_name}"])
+    if not res.ok:
+        # "no server running" when server exists but has no sessions
+        # "error connecting" when socket doesn't exist yet
+        if "no server running" in res.stderr.lower() or "error connecting" in res.stderr.lower():
+            return  # No sessions, print nothing
+        raise RuntimeError(res.stderr.strip() or "Failed to list sessions")
+    sessions = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    for s in sessions:
+        locked_indicator = " [LOCKED]" if _is_locked(s) else ""
+        print(f"{s}{locked_indicator}")
+
+def cmd_start(args: argparse.Namespace) -> None:
+    session = args.session
+    if _session_exists(session):
+        raise RuntimeError(f"Session '{session}' already exists (use 'kill' first to replace)")
+
+    # Validate env vars early
+    if args.env:
+        for kv in args.env:
+            if "=" not in kv:
+                raise ValueError(f"--env must be KEY=VALUE, got: {kv}")
+
+    # Validate cwd exists
+    if args.cwd:
+        if not os.path.isdir(args.cwd):
+            raise ValueError(f"--cwd directory does not exist: {args.cwd}")
+
+    # Validate shell exists and is executable
+    if args.shell:
+        if not os.path.isfile(args.shell):
+            raise ValueError(f"--shell does not exist: {args.shell}")
+        if not os.access(args.shell, os.X_OK):
+            raise ValueError(f"--shell is not executable: {args.shell}")
+
+    cols_default, rows_default = _size_defaults()
+    cols = args.cols if args.cols is not None else cols_default
+    rows = args.rows if args.rows is not None else rows_default
+
+    tmux_args = ["new-session", "-d", "-s", session]
+
+    if args.cwd:
+        tmux_args += ["-c", args.cwd]
+
+    if not args.no_size:
+        tmux_args += ["-x", str(cols), "-y", str(rows)]
+
+    # Pass env vars directly to new-session so the shell inherits them
+    if args.env:
+        for kv in args.env:
+            tmux_args += ["-e", kv]
+
+    if args.shell:
+        tmux_args += [args.shell]
+
+    res = _run_tmux(tmux_args)
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to start session")
+
+    # Workaround: some tmux versions ignore -x/-y on new-session -d when
+    # window-size is manual, so enforce size with resize-window after creation.
+    if not args.no_size:
+        _run_tmux(["resize-window", "-t", _exact(session), "-x", str(cols), "-y", str(rows)])
+
+    # Pin window size so tmux never resizes it based on attached clients.
+    # Agent-managed sessions should only be resized explicitly via
+    # ``term-cli resize``.  Without this, tmux's global window-size policy
+    # (default: "latest") would resize the window whenever a client
+    # attaches to *any* session on the same server.
+    _run_tmux(["set-option", "-t", _exact(session), "window-size", "manual"])
+
+    # Increase scrollback buffer so agents don't lose important output.
+    # tmux default is 2000 lines which is easily exceeded by verbose builds.
+    _run_tmux(["set-option", "-t", _exact(session), "history-limit", str(DEFAULT_HISTORY_LIMIT)])
+
+    # Set locked flag if requested
+    if args.locked:
+        _set_locked(session)
+
+    size_info = f" ({cols}x{rows})" if not args.no_size else ""
+    cwd_info = f" in {args.cwd}" if args.cwd else ""
+    locked_info = " [LOCKED]" if args.locked else ""
+    print(f"Created session '{session}'{size_info}{cwd_info}{locked_info}")
+
+def _list_sessions() -> list[str]:
+    """Return list of all session names, or empty list if none exist."""
+    res = _run_tmux(["list-sessions", "-F", "#{session_name}"])
+    if not res.ok:
+        # "no server running" when server exists but has no sessions
+        # "error connecting" when socket doesn't exist yet
+        if "no server running" in res.stderr.lower() or "error connecting" in res.stderr.lower():
+            return []
+        raise RuntimeError(res.stderr.strip() or "Failed to list sessions")
+    return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+def cmd_kill(args: argparse.Namespace) -> None:
+    if args.all and args.session:
+        raise ValueError("Cannot use --all with --session")
+    if not args.all and not args.session:
+        raise ValueError("Either --session or --all is required")
+
+    if args.all:
+        sessions = _list_sessions()
+        if not sessions:
+            print("No sessions to kill")
+            return
+        for session in sessions:
+            _require_unlocked(session)
+        # Validate all unattached (unless force)
+        if not args.force:
+            for session in sessions:
+                attached = _get_session_attached_count(session)
+                if attached > 0:
+                    raise RuntimeError(
+                        f"Session '{session}' has {attached} attached client(s). "
+                        f"Use --force to kill anyway."
+                    )
+        # All validated, proceed with kill
+        for session in sessions:
+            res = _run_tmux(["kill-session", "-t", _exact(session)])
+            if not res.ok:
+                raise RuntimeError(res.stderr.strip() or f"Failed to kill session '{session}'")
+            print(f"Killed session '{session}'")
+        return
+
+    session = args.session
+    if not _session_exists(session):
+        raise RuntimeError(f"Session '{session}' does not exist")
+    _require_unlocked(session)
+    
+    # Check for attached humans (unless force)
+    if not args.force:
+        attached = _get_session_attached_count(session)
+        if attached > 0:
+            raise RuntimeError(
+                f"Session '{session}' has {attached} attached client(s). "
+                f"Use --force to kill anyway."
+            )
+    
+    res = _run_tmux(["kill-session", "-t", _exact(session)])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to kill session")
+    print(f"Killed session '{session}'")
+
+def cmd_send_text(args: argparse.Namespace) -> None:
+    """Send literal text to the session. Optionally send Enter after."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    res = _run_tmux(["send-keys", "-t", _exact(session), "--", args.text])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send text")
+
+    if args.enter:
+        res2 = _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
+        if not res2.ok:
+            raise RuntimeError(res2.stderr.strip() or "Failed to send Enter")
+
+def cmd_send_key(args: argparse.Namespace) -> None:
+    """Send a tmux key (e.g., C-c, Enter, Up) to the session."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    res = _run_tmux(["send-keys", "-t", _exact(session), args.key])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send key")
+
+
+def _find_text_matches(screen: str, needle: str) -> list[tuple[int, int, int]]:
+    """Find all text matches as (row, col_start, col_end), 0-based."""
+    matches: list[tuple[int, int, int]] = []
+    for row, line in enumerate(screen.split("\n")):
+        start = 0
+        while True:
+            idx = line.find(needle, start)
+            if idx < 0:
+                break
+            matches.append((row, idx, idx + len(needle) - 1))
+            start = idx + 1
+    return matches
+
+
+def _mouse_x10(button_code: int, x: int, y: int, release: bool = False) -> str:
+    """Build an X10 mouse sequence for 0-based coordinates.
+
+    tmux `send-keys -l` is more reliable with X10 byte packets than SGR text
+    sequences for several ncurses TUIs (notably htop through SSH).
+    """
+    cb = 35 if release else button_code + 32
+    cx = x + 33
+    cy = y + 33
+    if cx > 255 or cy > 255:
+        raise ValueError(
+            f"Mouse coordinates out of X10 range: x={x}, y={y}; "
+            "max supported is 222"
+        )
+    return bytes((0x1B, 0x5B, 0x4D, cb, cx, cy)).decode("latin1")
+
+
+def _mouse_utf8(button_code: int, x: int, y: int, release: bool = False) -> str:
+    """Build a UTF-8 mouse sequence (xterm 1005) for 0-based coordinates."""
+    cb = 35 if release else button_code + 32
+    cx = x + 33
+    cy = y + 33
+    return b"\x1b[M".decode("latin1") + chr(cb) + chr(cx) + chr(cy)
+
+
+def _mouse_sgr(button_code: int, x: int, y: int, release: bool = False) -> str:
+    """Build an SGR mouse sequence (xterm 1006) for 0-based coordinates."""
+    suffix = "m" if release else "M"
+    return f"\x1b[<{button_code};{x + 1};{y + 1}{suffix}"
+
+
+def _mouse_packet(encoding: str, button_code: int, x: int, y: int, release: bool) -> str:
+    """Build a mouse packet in the selected encoding."""
+    if encoding == "x10":
+        return _mouse_x10(button_code, x, y, release=release)
+    if encoding == "utf8":
+        return _mouse_utf8(button_code, x, y, release=release)
+    if encoding == "sgr":
+        return _mouse_sgr(button_code, x, y, release=release)
+    raise ValueError(f"Unsupported mouse encoding: {encoding}")
+
+
+def _send_mouse_sequence(session: str, seq: str) -> None:
+    """Send a literal mouse escape sequence to the pane."""
+    res = _run_tmux(["send-keys", "-t", _exact(session), "-l", seq])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send mouse event")
+
+
+def _resolve_mouse_target(session: str, args: argparse.Namespace) -> tuple[int, int]:
+    """Resolve mouse target from text match or explicit coordinates."""
+    target_text: str | None = args.text
+
+    x: int
+    y: int
+
+    if target_text is not None:
+        if target_text == "":
+            raise ValueError("--text must not be empty")
+        if args.y is not None:
+            raise ValueError("--y cannot be used with --text")
+        if args.nth is not None and args.nth <= 0:
+            raise ValueError(f"--nth must be positive, got: {args.nth}")
+
+        screen = _capture_screen(session, trim=False, raw=False, join_wrapped=False)
+        matches = _find_text_matches(screen, target_text)
+        if not matches:
+            raise RuntimeError(f"Text not found on screen: {target_text!r}")
+
+        if args.nth is None:
+            if len(matches) > 1:
+                details = "\n".join(
+                    f"  {i}: row {row}, col {col_start}-{col_end}"
+                    for i, (row, col_start, col_end) in enumerate(matches, start=1)
+                )
+                raise RuntimeError(
+                    f"Text {target_text!r} matched {len(matches)} locations (0-based):\n"
+                    f"{details}\n"
+                    "Use --nth N to select one match"
+                )
+            y, col_start, col_end = matches[0]
+        else:
+            if args.nth > len(matches):
+                raise RuntimeError(
+                    f"Text {target_text!r} matched {len(matches)} locations; --nth {args.nth} is out of range"
+                )
+            y, col_start, col_end = matches[args.nth - 1]
+
+        x = (col_start + col_end) // 2
+    else:
+        if args.x is None or args.y is None:
+            raise ValueError("--x and --y are required unless --text is used")
+        if args.nth is not None:
+            raise ValueError("--nth can only be used with --text")
+        x = args.x
+        y = args.y
+
+    if x < 0 or y < 0:
+        raise ValueError(f"Coordinates must be >= 0, got: x={x}, y={y}")
+    cols, rows = _get_pane_dimensions(session)
+    if x >= cols or y >= rows:
+        raise ValueError(
+            f"Coordinates out of bounds: x={x}, y={y} for pane size {cols}x{rows}"
+        )
+    return (x, y)
+
+
+def _resolve_mouse_encoding(session: str, requested: str) -> str:
+    """Resolve mouse packet encoding (auto or explicit)."""
+    if requested != "auto":
+        return requested
+    mouse_mode = _get_mouse_mode(session)
+    encoding = mouse_mode.preferred_encoding() if mouse_mode is not None else None
+    return encoding or "x10"
+
+
+def cmd_send_mouse(args: argparse.Namespace) -> None:
+    """Send mouse click or wheel events by text target or coordinates."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    meta = _get_pane_metadata(session)
+    if not meta.alternate:
+        raise RuntimeError("Mouse input is only supported in alternate screen mode")
+
+    encoding = _resolve_mouse_encoding(session, args.mouse_encoding)
+    x, y = _resolve_mouse_target(session, args)
+
+    scroll_up_n = args.scroll_up
+    scroll_down_n = args.scroll_down
+    if (scroll_up_n is not None or scroll_down_n is not None) and args.button is not None:
+        raise ValueError("--button cannot be combined with --scroll-up/--scroll-down")
+
+    if scroll_up_n is not None:
+        if scroll_up_n <= 0:
+            raise ValueError(f"--scroll-up must be positive, got: {scroll_up_n}")
+        for _ in range(scroll_up_n):
+            _send_mouse_sequence(session, _mouse_packet(encoding, 64, x, y, release=False))
+        return
+    if scroll_down_n is not None:
+        if scroll_down_n <= 0:
+            raise ValueError(f"--scroll-down must be positive, got: {scroll_down_n}")
+        for _ in range(scroll_down_n):
+            _send_mouse_sequence(session, _mouse_packet(encoding, 65, x, y, release=False))
+        return
+
+    button = args.button or "left"
+    press_code = 0 if button == "left" else 2
+    _send_mouse_sequence(session, _mouse_packet(encoding, press_code, x, y, release=False))
+    _send_mouse_sequence(session, _mouse_packet(encoding, press_code, x, y, release=True))
+
+
+def cmd_send_stdin(args: argparse.Namespace) -> None:
+    """Send content from stdin to the session via tmux paste buffer."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    # Read from stdin
+    if sys.stdin.isatty():
+        raise ValueError("No input provided. Usage: term-cli send-stdin -s NAME < file.txt")
+    
+    content = sys.stdin.read()
+    if not content:
+        raise ValueError("Empty input provided")
+    
+    # Use tmux load-buffer to load content, then paste-buffer to send it
+    # load-buffer - reads from stdin when - is specified
+    tmux = _tmux_path()
+    tmux_args = [tmux]
+    if _tmux_socket:
+        tmux_args.extend(["-L", _tmux_socket])
+    tmux_args.extend(["load-buffer", "-"])
+    proc = subprocess.run(
+        tmux_args,
+        input=content,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "Failed to load buffer")
+    
+    # Paste buffer into the session
+    res = _run_tmux(["paste-buffer", "-t", _exact(session)])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to paste buffer")
+    
+    # Clean up the buffer
+    _run_tmux(["delete-buffer"])
+    
+    lines = content.count('\n')
+    chars = len(content)
+    print(f"Sent {chars} chars ({lines} lines) to '{session}'")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Send a command + Enter to the session. Optionally wait for prompt to return."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    res = _run_tmux(["send-keys", "-t", _exact(session), "--", args.command])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send command")
+    res2 = _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
+    if not res2.ok:
+        raise RuntimeError(res2.stderr.strip() or "Failed to send Enter")
+
+    if args.wait:
+        # Brief delay to let command start executing
+        time.sleep(0.1)
+        timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
+        success, elapsed = _wait_for_prompt(session, timeout)
+        if success:
+            print(f"Command completed ({elapsed:.1f}s)")
+        else:
+            raise OperationTimeout(f"command not completed after {timeout}s (may still be running)")
+    else:
+        if args.timeout is not None:
+            _eprint("Warning: --timeout has no effect without --wait")
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    """Capture and print the terminal screen content."""
+    session = args.session
+    _require_session(session)
+
+    trim = not args.no_trim
+    raw = args.raw
+    annotate_flag = args.annotate
+    no_annotate_flag = args.no_annotate
+    line_numbers = args.line_numbers
+    force = args.force
+    scrollback: int | None = args.scrollback
+    tail: int | None = args.tail
+
+    if scrollback is not None and tail is not None:
+        raise ValueError("--scrollback and --tail are mutually exclusive")
+
+    if annotate_flag and raw:
+        raise ValueError("--annotate and --raw are mutually exclusive")
+
+    if annotate_flag and scrollback is not None:
+        raise ValueError("--annotate cannot be combined with --scrollback")
+
+    if line_numbers and scrollback is not None:
+        raise ValueError("--line-numbers cannot be combined with --scrollback")
+
+    if scrollback is not None and not force and _is_alternate_screen(session):
+        raise ValueError(
+            "--scrollback is unreliable in alternate screen mode (TUI/TMUX) and may "
+            "return stale shell history. Use --force to override - if you know what you're doing."
+        )
+
+    # Auto-annotate only for active alternate-screen TUIs. In nested tmux/SSH,
+    # alternate_on may be true even at an idle shell prompt; keep default capture
+    # minimal in that case.
+    if annotate_flag:
+        annotate = True
+    elif no_annotate_flag:
+        annotate = False
+    elif raw or scrollback is not None:
+        annotate = False
+    else:
+        annotate = _is_alternate_screen(session) and not _is_at_prompt(session)
+
+    if annotate:
+        # --annotate: capture raw internally, produce stripped output + annotations
+        # Annotations are always computed on the full visible screen so detection
+        # is accurate; --tail just limits which lines/annotations are printed.
+        raw_output = _capture_screen(session, trim=False, raw=True)
+        annotations = _annotate_raw(raw_output)
+        meta = _get_pane_metadata(session)
+        stripped = _strip_ansi(raw_output)
+        if trim:
+            stripped = _trim_output(stripped)
+        numbered_lines = stripped.split("\n")
+        total = len(numbered_lines)
+        # Determine which 0-based rows to show
+        if tail is not None:
+            if tail <= 0:
+                raise ValueError(f"--tail must be positive, got: {tail}")
+            first_row = max(0, total - tail)
+        else:
+            first_row = 0
+        # Optional line numbering (1-based). Use 3-digit field; rows beyond
+        # 999 overflow naturally while keeping the delimiter unambiguous.
+        for i, line in enumerate(numbered_lines):
+            row_num = i
+            if row_num >= first_row:
+                if line_numbers:
+                    print(f"{row_num + 1:3d}│ {line}")
+                else:
+                    print(line)
+        # Metadata section: screen, bell, cursor, then highlights
+        print("Annotations:")
+        if meta.alternate:
+            print("  Screen: alternate")
+        if meta.bell:
+            print("  Bell: yes (cleared)")
+            _clear_alert_flags(session)
+        if meta.cursor is not None:
+            print(f"  Cursor: {_format_cursor_row_col(meta.cursor)}")
+        mouse_mode = _get_mouse_mode(session)
+        if mouse_mode is not None and mouse_mode.any:
+            mouse_label = mouse_mode.preferred_encoding() or "on"
+            print(f"  Mouse: {mouse_label}")
+        if annotations:
+            for row, text, label in annotations:
+                if row >= first_row:
+                    print(f"{row + 1:3d}│ {text} [{label}]")
+        return
+
+    if scrollback is not None:
+        if scrollback <= 0:
+            raise ValueError(f"--scrollback must be positive, got: {scrollback}")
+        # Capture scrollback history with -J (join wrapped lines for logical lines).
+        # Use a generous -S to grab more than needed, then truncate to exactly N lines.
+        tmux_args = ["capture-pane", "-p", "-J", "-t", _exact(session), "-S", f"-{scrollback}"]
+        if raw:
+            tmux_args.insert(2, "-e")
+        res = _run_tmux(tmux_args)
+        if not res.ok:
+            raise RuntimeError(res.stderr.strip() or "Failed to capture pane")
+        output = res.stdout
+        if trim:
+            output = _trim_output(output)
+        # Truncate to exactly N logical lines (tmux may return more due to
+        # -S being physical-row-based while -J joins wrapped lines).
+        lines = output.split('\n')
+        if len(lines) > scrollback:
+            lines = lines[-scrollback:]
+        output = '\n'.join(lines)
+    elif tail is not None:
+        if tail <= 0:
+            raise ValueError(f"--tail must be positive, got: {tail}")
+        # Capture visible screen without -J (preserve physical rows),
+        # then take the last N rows.
+        output = _capture_screen(session, trim=trim, raw=raw, join_wrapped=False)
+        lines = output.split('\n')
+        if len(lines) > tail:
+            lines = lines[-tail:]
+        output = '\n'.join(lines)
+    else:
+        # Capture only visible screen (no -J, physical rows preserved)
+        output = _capture_screen(session, trim=trim, raw=raw)
+
+    if line_numbers:
+        lines = output.split('\n')
+        for i, line in enumerate(lines, start=1):
+            print(f"{i:3d}│ {line}")
+    else:
+        print(output)
+
+def cmd_pipe_log(args: argparse.Namespace) -> None:
+    """Stream terminal output to a log file (ANSI escapes stripped by default)."""
+    session = args.session
+    _require_session(session)
+
+    # pipe-pane -o silently does nothing when already piping, which can mislead
+    # callers into thinking the destination changed. Fail clearly instead.
+    pipe_state = _run_tmux(["display-message", "-p", "-t", _exact(session), "#{pane_pipe}"])
+    if pipe_state.ok and pipe_state.stdout.strip() == "1":
+        raise RuntimeError("Session is already piping output. Run unpipe first.")
+
+    logfile = os.path.abspath(args.file)
+    
+    # Validate parent directory exists
+    parent_dir = os.path.dirname(logfile)
+    if parent_dir and not os.path.isdir(parent_dir):
+        raise ValueError(f"Parent directory does not exist: {parent_dir}")
+    
+    if args.raw:
+        # Raw output including escape codes
+        shell_cmd = f"cat >> {shlex.quote(logfile)}"
+    else:
+        # Strip ANSI escape codes with Python stdlib (no perl dependency).
+        # Handles CSI and OSC sequences, including OSC terminated with BEL or ST.
+        strip_script = "\n".join([
+            "import re",
+            "import os",
+            "import sys",
+            "ansi = re.compile(br'\\x1b\\[[0-?]*[ -/]*[@-~]')",
+            "osc = re.compile(br'\\x1b\\][^\\x1b\\x07]*(?:\\x07|\\x1b\\\\)')",
+            "for chunk in iter(lambda: os.read(0, 4096), b''):",
+            "    chunk = osc.sub(b'', chunk)",
+            "    chunk = ansi.sub(b'', chunk)",
+            "    sys.stdout.buffer.write(chunk)",
+            "    sys.stdout.buffer.flush()",
+        ])
+        python_cmd = shlex.quote(sys.executable or "python3")
+        shell_cmd = f"{python_cmd} -u -c {shlex.quote(strip_script)} >> {shlex.quote(logfile)}"
+    
+    res = _run_tmux(["pipe-pane", "-o", "-t", _exact(session), shell_cmd])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to pipe pane")
+
+    mode = "raw" if args.raw else "clean"
+    print(f"Piping output to {logfile} ({mode})")
+
+def cmd_unpipe(args: argparse.Namespace) -> None:
+    """Stop streaming output to a log file."""
+    session = args.session
+    _require_session(session)
+
+    res = _run_tmux(["pipe-pane", "-t", _exact(session)])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to stop piping")
+    print(f"Stopped piping output")
+
+def _get_process_tree(pane_pid: int) -> list[tuple[int, int, str, str]]:
+    """Get all descendant processes of the pane shell.
+    
+    Returns list of (pid, ppid, stat, command) tuples for all descendants.
+    Uses portable POSIX ps command.
+    """
+    # Get all processes with pid, ppid, stat, command
+    proc = subprocess.run(
+        ["ps", "-eo", "pid,ppid,stat,comm"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    
+    # Parse output and find descendants
+    descendants = []
+    known_pids = {pane_pid}
+    
+    # Parse all lines first
+    all_procs = []
+    for line in proc.stdout.strip().split('\n')[1:]:  # Skip header
+        parts = line.split()
+        if len(parts) >= 4:
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+                stat = parts[2]
+                comm = parts[3]
+                all_procs.append((pid, ppid, stat, comm))
+            except (ValueError, IndexError):
+                continue
+    
+    # Find descendants iteratively (may need multiple passes)
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, stat, comm in all_procs:
+            if ppid in known_pids and pid not in known_pids:
+                known_pids.add(pid)
+                descendants.append((pid, ppid, stat, comm))
+                changed = True
+    
+    return descendants
+
+
+def _is_foreground_process(stat: str) -> bool:
+    """Check if STAT indicates a foreground process (has + flag)."""
+    return '+' in stat
+
+
+def _format_process_tree(process_tree: list[tuple[int, int, str, str]], pane_pid: int) -> list[str]:
+    """Format process tree as ASCII tree with PIDs.
+    
+    Args:
+        process_tree: List of (pid, ppid, stat, comm) tuples
+        pane_pid: The shell's PID (root of the tree)
+    
+    Returns:
+        List of formatted lines for the tree
+    """
+    if not process_tree:
+        return []
+    
+    # Build a children map: ppid -> list of (pid, comm)
+    children_map: dict[int, list[tuple[int, str]]] = {}
+    for pid, ppid, stat, comm in process_tree:
+        if ppid not in children_map:
+            children_map[ppid] = []
+        children_map[ppid].append((pid, comm))
+    
+    lines: list[str] = []
+    
+    def render_children(parent_pid: int, prefix: str, is_root: bool = False) -> None:
+        """Recursively render children of a process."""
+        children = children_map.get(parent_pid, [])
+        for i, (pid, comm) in enumerate(children):
+            is_last = (i == len(children) - 1)
+            connector = "└─" if is_last else "├─"
+            lines.append(f"{prefix}{connector} {comm} ({pid})")
+            # For children of this process, adjust prefix
+            if is_root:
+                child_prefix = "   " if is_last else "│  "
+            else:
+                child_prefix = prefix + ("   " if is_last else "│  ")
+            render_children(pid, child_prefix)
+    
+    # Start rendering from direct children of the shell (no initial indent)
+    render_children(pane_pid, "", is_root=True)
+    
+    return lines
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    session = args.session
+    _require_session(session)
+    
+    # Get comprehensive session and pane info
+    fmt = "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{alternate_on}\t#{pane_title}\t#{window_bell_flag}"
+    res = _run_tmux(["display-message", "-p", "-t", _exact(session), fmt])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to read session info")
+
+    parts = res.stdout.strip().split("\t")
+    
+    def safe_int(s: str) -> int | None:
+        try:
+            return int(s)
+        except (ValueError, TypeError):
+            return None
+
+    name = parts[0] if len(parts) > 0 else session
+    created = safe_int(parts[1]) if len(parts) > 1 else None
+    windows = safe_int(parts[2]) if len(parts) > 2 else None
+    attached = safe_int(parts[3]) if len(parts) > 3 else None
+    width = safe_int(parts[4]) if len(parts) > 4 else None
+    height = safe_int(parts[5]) if len(parts) > 5 else None
+    pane_pid = safe_int(parts[6]) if len(parts) > 6 else None
+    alternate_on = parts[7].strip() == "1" if len(parts) > 7 else False
+    pane_title = parts[8] if len(parts) > 8 else ""
+    bell_flag = parts[9].strip() == "1" if len(parts) > 9 else False
+
+    # Get shell name from pane_pid using ps
+    shell_name = None
+    if pane_pid:
+        proc = subprocess.run(
+            ["ps", "-p", str(pane_pid), "-o", "comm="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode == 0:
+            shell_name = proc.stdout.strip().lstrip('-')  # Remove leading - from login shells
+
+    # Determine state: idle or running
+    state = "idle"
+    foreground_command = None
+    process_tree = []
+    
+    if pane_pid:
+        process_tree = _get_process_tree(pane_pid)
+        # Find foreground processes (those with + in STAT)
+        foreground_procs = [(pid, ppid, stat, comm) for pid, ppid, stat, comm in process_tree
+                           if _is_foreground_process(stat)]
+        if foreground_procs:
+            state = "running"
+            # Get the deepest foreground process (last in chain)
+            foreground_command = foreground_procs[-1][3] if foreground_procs else None
+
+    print(f"Session: {name}")
+    print(f"State: {state}")
+    if foreground_command:
+        print(f"Foreground: {foreground_command}")
+    print(f"Screen: {'alternate' if alternate_on else 'normal'}")
+    if pane_title:
+        print(f"Title: {pane_title}")
+    if bell_flag:
+        print("Bell: yes (cleared)")
+        _clear_alert_flags(session)
+    if width and height:
+        print(f"Size: {width}x{height}")
+    cursor = _get_cursor_position(session)
+    if cursor is not None:
+        print(f"Cursor: {_format_cursor_row_col(cursor)}")
+    mouse_mode = _get_mouse_mode(session)
+    if mouse_mode is not None:
+        print(f"Mouse: {mouse_mode.status_string()}")
+    print(f"Locked: {'yes' if _is_locked(session) else 'no'}")
+    # Show process tree with shell as root
+    if pane_pid and shell_name:
+        print("Processes:")
+        print(f"└─ {shell_name} ({pane_pid})")
+        if process_tree:
+            tree_lines = _format_process_tree(process_tree, pane_pid)
+            for line in tree_lines:
+                print(f"   {line}")
+    if windows is not None:
+        print(f"Windows: {windows}")
+    if attached is not None:
+        print(f"Attached: {'yes' if attached else 'no'}")
+    if created:
+        dt = datetime.fromtimestamp(created)
+        print(f"Created: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+def cmd_resize(args: argparse.Namespace) -> None:
+    """Resize the terminal to specified dimensions."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    cols = args.cols
+    rows = args.rows
+
+    if cols is None and rows is None:
+        raise ValueError("Must specify --cols and/or --rows")
+
+    # Get current dimensions for any not specified
+    current_cols, current_rows = _get_pane_dimensions(session)
+    cols = cols if cols is not None else current_cols
+    rows = rows if rows is not None else current_rows
+
+    # Resize using resize-window
+    res = _run_tmux(["resize-window", "-t", _exact(session), "-x", str(cols), "-y", str(rows)])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to resize session")
+    
+    print(f"Resized session '{session}' to {cols}x{rows}")
+
+def cmd_scroll(args: argparse.Namespace) -> None:
+    """Scroll the viewport up (negative) or down (positive)."""
+    session = args.session
+    _require_session(session)
+
+    lines = args.lines
+    if lines == 0:
+        raise ValueError("Scroll lines must be non-zero")
+    direction = "up" if lines < 0 else "down"
+    abs_lines = abs(lines)
+
+    # Enter copy mode and scroll
+    res = _run_tmux(["copy-mode", "-t", _exact(session)])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to enter copy mode")
+
+    # Scroll using send-keys in copy mode
+    if lines < 0:
+        # Scroll up
+        for _ in range(abs_lines):
+            _run_tmux(["send-keys", "-t", _exact(session), "-X", "scroll-up"])
+    else:
+        # Scroll down
+        for _ in range(abs_lines):
+            _run_tmux(["send-keys", "-t", _exact(session), "-X", "scroll-down"])
+
+    print(f"Scrolled {direction} {abs_lines} lines")
+
+def cmd_wait(args: argparse.Namespace) -> None:
+    """Wait for shell prompt to appear (command completion)."""
+    session = args.session
+    _require_session(session)
+
+    timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
+    if timeout < 0:
+        raise ValueError(f"Timeout must be non-negative, got: {timeout}")
+    
+    success, elapsed = _wait_for_prompt(session, timeout)
+    
+    if success:
+        print(f"Prompt detected ({elapsed:.1f}s)")
+    else:
+        raise OperationTimeout(f"prompt not detected after {timeout}s")
+
+def cmd_wait_idle(args: argparse.Namespace) -> None:
+    """Wait until terminal output stops changing for a specified duration."""
+    session = args.session
+    _require_session(session)
+
+    idle_seconds = args.idle if args.idle is not None else DEFAULT_IDLE_SECONDS
+    timeout = args.timeout if args.timeout is not None else DEFAULT_IDLE_TIMEOUT
+    if idle_seconds < 0:
+        raise ValueError(f"Idle seconds must be non-negative, got: {idle_seconds}")
+    if timeout < 0:
+        raise ValueError(f"Timeout must be non-negative, got: {timeout}")
+    
+    success, elapsed = _wait_for_idle(session, idle_seconds, timeout)
+    
+    if success:
+        print(f"Idle for {idle_seconds}s (waited {elapsed:.1f}s)")
+    else:
+        raise OperationTimeout(f"output still changing after {timeout}s")
+
+def cmd_wait_for(args: argparse.Namespace) -> None:
+    session = args.session
+    _require_session(session)
+
+    patterns = args.patterns
+    timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
+    ignore_case = args.ignore_case
+    print_match = args.print_match
+    context = args.print_match_context
+    if context is not None:
+        if context < 0:
+            raise ValueError(f"Context lines must be non-negative, got: {context}")
+        print_match = True  # --print-match-context implies --print-match
+    
+    if timeout < 0:
+        raise ValueError(f"Timeout must be non-negative, got: {timeout}")
+    
+    start = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+    
+    while True:
+        # Join wrapped physical rows so patterns that span terminal-wrap
+        # boundaries are detected as a single logical line.
+        screen = _capture_screen(session, trim=True, join_wrapped=True)
+        lines = screen.split('\n')
+        
+        for pattern in patterns:
+            # Check each line for the pattern
+            for idx, line in enumerate(lines):
+                check_line = line.lower() if ignore_case else line
+                check_pattern = pattern.lower() if ignore_case else pattern
+                
+                if check_pattern in check_line:
+                    elapsed = time.time() - start
+                    print(f'Pattern detected ({elapsed:.1f}s): "{pattern}"')
+                    if print_match:
+                        if context is not None and context > 0:
+                            ctx_start = max(0, idx - context)
+                            ctx_end = min(len(lines), idx + context + 1)
+                            for ctx_line in lines[ctx_start:ctx_end]:
+                                print(ctx_line)
+                        else:
+                            print(line)
+                    return
+        
+        elapsed = time.time() - start
+        if elapsed >= timeout:
+            patterns_str = '", "'.join(patterns)
+            raise OperationTimeout(f'pattern not detected after {timeout}s (searched for: "{patterns_str}")')
+        
+        time.sleep(poll_interval)
+        # Increase poll interval gradually to reduce CPU usage during long waits
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+def _get_session_attached_count(session: str) -> int:
+    """Get number of clients attached to session."""
+    res = _run_tmux(["display-message", "-p", "-t", _exact(session), "#{session_attached}"])
+    if res.ok:
+        try:
+            return int(res.stdout.strip())
+        except ValueError:
+            pass
+    return 0
+
+
+def _get_request(session: str) -> str | None:
+    """Get pending request message for session, or None if no request."""
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_REQUEST_OPT])
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip()
+    return None
+
+
+def _clear_request(session: str) -> None:
+    """Clear pending request for session."""
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_REQUEST_OPT])
+
+
+def _get_response(session: str) -> str | None:
+    """Get response message for session, or None if no response."""
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_RESPONSE_OPT])
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip()
+    return None
+
+
+def _clear_response(session: str) -> None:
+    """Clear response for session."""
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_RESPONSE_OPT])
+
+
+def _get_detached(session: str) -> bool:
+    """Check if detached flag is set for session."""
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_DETACHED_OPT])
+    return res.ok and res.stdout.strip() != ""
+
+
+def _clear_detached(session: str) -> None:
+    """Clear detached flag for session."""
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_DETACHED_OPT])
+
+
+def _is_locked(session: str) -> bool:
+    """Check if session is locked (agent read-only mode)."""
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_LOCKED_OPT])
+    return res.ok and res.stdout.strip() != ""
+
+
+def _require_unlocked(session: str) -> None:
+    """Raise AgentLocked if session is locked."""
+    if _is_locked(session):
+        raise AgentLocked(f"Session '{session}' is locked (agent read-only mode)")
+
+
+def _set_locked(session: str) -> None:
+    """Lock session (agent read-only mode)."""
+    _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_LOCKED_OPT, "1"])
+
+
+def cmd_upload(args: argparse.Namespace) -> None:
+    """Upload a local file (or stdin) to the session's shell (e.g. over SSH)."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+    _require_prompt_ready(session)
+
+    pane_w, _ = _get_pane_dimensions(session)
+    if pane_w < MIN_TRANSFER_COLS:
+        raise ValueError(
+            f"Terminal too narrow for file transfers: {pane_w} columns "
+            f"(minimum {MIN_TRANSFER_COLS}). Resize with: term-cli resize -s {session} -x {MIN_TRANSFER_COLS}"
+        )
+
+    local_path = args.local_path
+    from_stdin = local_path == "-"
+
+    if from_stdin:
+        if sys.stdin.isatty():
+            raise ValueError(
+                "Refusing to read from terminal — pipe data to stdin "
+                "(e.g. cat file | term-cli upload -s NAME - REMOTE_PATH)"
+            )
+        if not args.remote_path:
+            raise ValueError(
+                "REMOTE_PATH is required when uploading from stdin"
+            )
+        raw_data = sys.stdin.buffer.read()
+    else:
+        if not os.path.isfile(local_path):
+            raise ValueError(f"Local file does not exist: {local_path}")
+        with open(local_path, "rb") as f:
+            raw_data = f.read()
+
+    if not raw_data:
+        src = "stdin" if from_stdin else local_path
+        raise ValueError(f"No data to upload ({src} is empty)")
+
+    remote_path = args.remote_path or os.path.basename(local_path)
+    timeout: float = args.timeout if args.timeout is not None else DEFAULT_TRANSFER_TIMEOUT
+    verbose: bool = args.verbose
+    force: bool = args.force
+
+    remote_quoted = shlex.quote(remote_path)
+
+    # Probe for Python 3 and check file existence on alt-screen so the
+    # probe commands don't clutter the user's visible terminal.
+    # _hide_probe_start enters alt-screen (saving normal screen with the
+    # echoed command on the prompt line).  _run_helper(already_on_alt=True)
+    # leaves alt-screen, erases the prompt line, then the helper re-enters
+    # alt-screen saving the cleaned normal screen.
+    _hide_probe_start(session)
+    try:
+        python_bin = _probe_python(session, timeout)
+        file_exists = not force and _remote_file_exists(session, remote_path, timeout)
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+    if file_exists:
+        _restore_terminal(session)
+        raise ValueError(
+            f"Remote file already exists: {remote_path} (use --force to overwrite)"
+        )
+
+    if verbose:
+        _eprint(f"Remote Python: {python_bin}")
+
+    # Always compress with gzip
+    payload = gzip.compress(raw_data, compresslevel=6)
+    if verbose:
+        ratio = len(payload) / len(raw_data) * 100
+        _eprint(f"Compressed {len(raw_data)} -> {len(payload)} bytes ({ratio:.0f}%)")
+
+    b64_data = base64.encodebytes(payload).decode("ascii")
+
+    # Compute local hash for verification (always sha256 via Python helper)
+    local_sha = hashlib.sha256(raw_data).hexdigest()
+
+    start_time = time.time()
+    try:
+        # Deploy Python helper with upload command
+        helper_args = f"upload {remote_quoted} {len(b64_data)}"
+        _run_helper(session, python_bin, helper_args, already_on_alt=True)
+
+        # Wait for TC_READY (trial write succeeded, script is reading /dev/tty)
+        # or TC_NOWRITE (destination not writable) or TC_ERR.
+        # Use up to 30s or the caller's timeout, whichever is smaller — the
+        # helper needs time to start up (paste + python3 + gzip decompress)
+        # which can be slow over SSH.
+        ready_timeout = min(timeout, 30.0)
+        marker, _ = _wait_for_any_text(
+            session, ["TC_READY", "TC_NOWRITE", "TC_ERR"], timeout=ready_timeout,
+        )
+        if marker == "TC_NOWRITE":
+            _dismiss_helper(session)
+            _wait_for_prompt(session, 5.0)
+            raise ValueError(
+                f"Cannot write to remote path: {remote_path} "
+                "(permission denied or directory does not exist)"
+            )
+        if marker == "TC_ERR":
+            screen = _capture_screen(session, trim=True)
+            err_msg = "Remote helper reported an error"
+            m = re.search(r"TC_ERR\s+(.+)", screen)
+            if m:
+                err_msg = m.group(1).strip()
+            _dismiss_helper(session)
+            _wait_for_prompt(session, 5.0)
+            raise RuntimeError(err_msg)
+        if marker is None:
+            raise OperationTimeout(
+                f"Receiver did not become ready within {ready_timeout:.0f}s "
+                "(TC_READY not seen — is the remote shell responsive?)"
+            )
+
+        # Paste base64 payload — script reads exactly len(b64_data) bytes from /dev/tty
+        if verbose:
+            _eprint(f"Pasting {len(b64_data)} bytes of base64 data...")
+        _load_and_paste(session, b64_data)
+
+        # Wait for TC_DONE <sha256> (script finished writing + hashing)
+        done_marker, _ = _wait_for_any_text(
+            session, ["TC_DONE", "TC_ERR"], timeout=timeout,
+        )
+        if done_marker == "TC_ERR":
+            screen = _capture_screen(session, trim=True)
+            err_msg = "Remote helper reported an error"
+            m = re.search(r"TC_ERR\s+(.+)", screen)
+            if m:
+                err_msg = m.group(1).strip()
+            _dismiss_helper(session)
+            _wait_for_prompt(session, 5.0)
+            raise RuntimeError(err_msg)
+        if done_marker is None:
+            raise OperationTimeout(f"upload did not complete within {timeout}s")
+
+        # Parse TC_DONE to extract remote sha256.
+        # Use regex on the raw capture to handle line wrapping on narrow terminals.
+        screen = _capture_screen(session, trim=True)
+        remote_sha: str | None = None
+        m = re.search(r"TC_DONE\s+([0-9a-f]{64})", screen)
+        if m:
+            remote_sha = m.group(1)
+
+        # Dismiss the helper (it's blocking on _wait_for_dismiss on alt-screen)
+        _dismiss_helper(session)
+
+        # Wait for prompt to return (helper exits, alt-screen closes, stty echo restored)
+        _wait_for_prompt(session, timeout)
+
+        # Verify hash
+        if remote_sha:
+            if local_sha != remote_sha:
+                # Clean up corrupt file
+                _remote_exec(session, f"rm -f {remote_quoted}", 5.0)
+                raise RuntimeError(
+                    f"Hash mismatch (sha256): "
+                    f"local={local_sha} remote={remote_sha}"
+                )
+            if verbose:
+                _eprint(f"Hash verified (sha256): {local_sha[:16]}...")
+        else:
+            _eprint("Warning: could not parse remote hash from TC_DONE marker")
+
+        total_time = time.time() - start_time
+        size_str = _format_size(len(raw_data))
+        print(f"Uploaded {size_str} to '{remote_path}' ({total_time:.1f}s)")
+
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    """Download a file from the session's shell to the local machine (or stdout)."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+    _require_prompt_ready(session)
+    start_on_alt = _is_alternate_screen(session)
+
+    pane_w, _ = _get_pane_dimensions(session)
+    if pane_w < MIN_TRANSFER_COLS:
+        raise ValueError(
+            f"Terminal too narrow for file transfers: {pane_w} columns "
+            f"(minimum {MIN_TRANSFER_COLS}). Resize with: term-cli resize -s {session} -x {MIN_TRANSFER_COLS}"
+        )
+
+    remote_path = args.remote_path
+    to_stdout = args.local_path == "-"
+
+    if to_stdout:
+        local_path = "-"
+    else:
+        local_path = os.path.abspath(args.local_path or os.path.basename(remote_path))
+
+    timeout: float = args.timeout if args.timeout is not None else DEFAULT_TRANSFER_TIMEOUT
+    verbose: bool = args.verbose
+    force: bool = args.force
+
+    # Check local path (skip for stdout)
+    if not to_stdout and not force and os.path.exists(local_path):
+        raise ValueError(
+            f"Local file already exists: {local_path} (use --force to overwrite)"
+        )
+
+    # Probe for Python 3 and check file existence on alt-screen so the
+    # probe commands don't clutter the user's visible terminal.
+    _hide_probe_start(session)
+    try:
+        python_bin = _probe_python(session, timeout)
+        file_exists = _remote_file_exists(session, remote_path, timeout)
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+    if not file_exists:
+        _restore_terminal(session)
+        raise ValueError(f"Remote file does not exist: {remote_path}")
+
+    if verbose:
+        _eprint(f"Remote Python: {python_bin}")
+
+    start_time = time.time()
+
+    # Check remembered strategy
+    strategy = _get_dl_strategy(session)
+    decoded: bytes | None = None
+    remote_sha: str = ""
+    # Track whether the probes' alt-screen is still active so we can pass
+    # already_on_alt=True to the first _run_helper call that will leave it.
+    on_probe_alt = True
+
+    try:
+        if not start_on_alt and strategy != "chunked":
+            # Try pipe-pane first
+            if verbose:
+                _eprint("Trying pipe-pane download strategy...")
+
+            # Use a local temp file for pipe-pane output
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix="tc_dl_", suffix=".raw")
+            os.close(tmp_fd)
+            try:
+                result = _download_pipe(
+                    session, remote_path, tmp_path, python_bin,
+                    timeout, verbose,
+                    already_on_alt=True,
+                )
+                on_probe_alt = False
+            except Exception as exc:
+                if verbose:
+                    _eprint(f"Pipe-pane raised {type(exc).__name__}: {exc}")
+                # Clean up temp file on error
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                # Restore terminal to clean state before chunked fallback —
+                # the helper may still be running or the shell may not be
+                # at a prompt after the pipe-pane failure/timeout.
+                _restore_terminal(session)
+                on_probe_alt = False
+                result = None
+
+            if result is not None:
+                decoded_candidate, remote_sha_candidate = result
+                if remote_sha_candidate:
+                    local_sha_candidate = hashlib.sha256(decoded_candidate).hexdigest()
+                    if local_sha_candidate != remote_sha_candidate:
+                        if verbose:
+                            _eprint(
+                                "pipe-pane: hash mismatch, switching to chunked strategy"
+                            )
+                        _set_dl_strategy(session, "chunked")
+                    else:
+                        decoded, remote_sha = decoded_candidate, remote_sha_candidate
+                else:
+                    # Keep existing behavior: accept payload even if remote hash
+                    # marker was not parsed; final verification will be skipped.
+                    decoded, remote_sha = decoded_candidate, remote_sha_candidate
+            else:
+                if verbose:
+                    _eprint("Pipe-pane failed or corruption detected, switching to chunked")
+                _set_dl_strategy(session, "chunked")
+
+        if decoded is None:
+            # Chunked fallback
+            if verbose:
+                if start_on_alt:
+                    _eprint("Using chunked screen-capture download strategy (alternate screen mode)...")
+                else:
+                    _eprint("Using chunked screen-capture download strategy...")
+            decoded, remote_sha = _download_chunked(
+                session, remote_path, python_bin, timeout, verbose,
+                already_on_alt=on_probe_alt,
+            )
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+    # Verify hash (always sha256 from Python helper)
+    if remote_sha:
+        local_sha = hashlib.sha256(decoded).hexdigest()
+        if local_sha != remote_sha:
+            raise RuntimeError(
+                f"Hash mismatch (sha256): "
+                f"remote={remote_sha} local={local_sha}"
+            )
+        if verbose:
+            _eprint(f"Hash verified (sha256): {local_sha[:16]}...")
+    else:
+        _eprint("Warning: could not verify hash (remote hash not received)")
+
+    if to_stdout:
+        # Write binary data to stdout
+        sys.stdout.buffer.write(decoded)
+        sys.stdout.buffer.flush()
+    else:
+        # Write to local file
+        parent = os.path.dirname(local_path)
+        if parent and not os.path.isdir(parent):
+            raise ValueError(f"Parent directory does not exist: {parent}")
+        with open(local_path, "wb") as f:
+            f.write(decoded)
+
+    total_time = time.time() - start_time
+    size_str = _format_size(len(decoded))
+    dest = "stdout" if to_stdout else f"'{local_path}'"
+    # Use _eprint for stdout mode so binary data isn't mixed with status
+    output_fn = _eprint if to_stdout else print
+    output_fn(f"Downloaded {size_str} to {dest} ({total_time:.1f}s)")
+
+
+def cmd_request(args: argparse.Namespace) -> None:
+    """Request human assistance on a session."""
+    session = args.session
+    _require_session(session)
+    
+    message = args.message or "Human assistance requested"
+    
+    # Clear stale state from previous requests.
+    _clear_detached(session)
+    _clear_response(session)
+    
+    # Store request in tmux user option (can be read via #{@term_cli_request} in format strings)
+    _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_REQUEST_OPT, message])
+    print(f"Request stored for session '{session}'")
+
+
+def cmd_request_wait(args: argparse.Namespace) -> None:
+    """Wait for human to complete a request."""
+    session = args.session
+    _require_session(session)
+    
+    # Check if there's a pending request
+    if not _get_request(session):
+        raise ValueError(f"No pending request for session '{session}'")
+    
+    timeout = args.timeout if args.timeout is not None else DEFAULT_REQUEST_TIMEOUT
+    if timeout < 0:
+        raise ValueError(f"Timeout must be non-negative, got: {timeout}")
+    
+    start = time.time()
+    
+    while True:
+        # Check if human detached without completing
+        if _get_detached(session):
+            _clear_detached(session)  # Clear so next request-wait can block
+            elapsed = time.time() - start
+            raise HumanDetached(f"term-assist detached without response ({elapsed:.1f}s)")
+        
+        # Check if request was cleared (completed)
+        if not _get_request(session):
+            # Check for response message from human
+            response = _get_response(session)
+            if response:
+                print(f"Response: {response}")
+                _clear_response(session)
+            elapsed = time.time() - start
+            print(f"Request completed ({elapsed:.1f}s)")
+            return
+        
+        elapsed = time.time() - start
+        if elapsed >= timeout:
+            raise OperationTimeout(f"human did not respond within {timeout}s")
+        
+        time.sleep(1.0)
+
+
+def cmd_request_cancel(args: argparse.Namespace) -> None:
+    """Cancel a pending request."""
+    session = args.session
+    _require_session(session)
+    
+    if not _get_request(session):
+        raise ValueError(f"No pending request for session '{session}'")
+    
+    _clear_request(session)
+    _clear_response(session)  # Clear any lingering response too
+    _clear_detached(session)  # Clear any detached flag too
+    print(f"Cancelled request for session '{session}'")
+
+
+def cmd_request_status(args: argparse.Namespace) -> None:
+    """Check if a request is pending."""
+    session = args.session
+    _require_session(session)
+    
+    request = _get_request(session)
+    if request:
+        print("pending")
+    else:
+        raise QueryResult("none")
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    cols_default, rows_default = _size_defaults()
+
+    p = argparse.ArgumentParser(
+        prog="term-cli",
+        description="""Non-interactive terminal session control for AI agents (tmux wrapper).
+
+Requires: tmux on PATH
+
+Use 'term-cli <command> -h' for command-specific help.
+
+Exit codes: 0=success, 1=runtime error, 2=invalid input, 3=timeout, 4=detached, 5=locked, 127=tmux not found
+
+tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left Right, Home End NPage PPage, F1-F12""",
+        epilog="""Examples:
+  term-cli start --session build --cwd /path/to/project
+  term-cli run --session build "make test" --wait --timeout 60
+  term-cli capture --session build
+  term-cli send-mouse --session build --text "OK"
+  term-cli send-key --session build C-c
+  term-cli wait --session build --timeout 10
+  term-cli upload --session build ./config.json /app/config.json
+  term-cli kill --session build
+
+Short forms (commands and flags can be abbreviated):
+  term-cli send-t -s b ":wq" -e      # send-text --session b ":wq" --enter
+  term-cli wait-i -s b -i 3 -t 5     # wait-idle --session b --idle 3 --timeout 5
+
+Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var'""",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    
+    # Global options (before subcommands)
+    p.add_argument("-L", "--socket-name", metavar="NAME",
+                   help="Use a different tmux socket (for isolated servers)")
+    
+    sub = p.add_subparsers(dest="cmd", required=False, metavar="<command>")
+
+    # list
+    sp = sub.add_parser("list", help="List sessions")
+    sp.set_defaults(func=cmd_list)
+
+    # start
+    sp = sub.add_parser("start", help="Create session (fails if exists)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-c", "--cwd", metavar="DIR", help="Working directory")
+    sp.add_argument("-x", "--cols", type=int, metavar="N", help=f"Width (default: {cols_default})")
+    sp.add_argument("-y", "--rows", type=int, metavar="N", help=f"Height (default: {rows_default})")
+    sp.add_argument("-e", "--env", action="append", default=[], metavar="K=V", help="Set env var (repeatable)")
+    sp.add_argument("--shell", metavar="CMD", help="Shell command (default: user shell)")
+    sp.add_argument("--no-size", action="store_true", help="Let tmux decide size")
+    sp.add_argument("-l", "--locked", action="store_true", help="Start locked (agent read-only)")
+    sp.set_defaults(func=cmd_start)
+
+    # kill
+    sp = sub.add_parser("kill", help="Kill session (fails if not exists)")
+    sp.add_argument("-s", "--session", metavar="NAME", help="Session name")
+    sp.add_argument("-a", "--all", action="store_true", help="Kill all sessions")
+    sp.add_argument("-f", "--force", action="store_true", help="Kill even if humans attached")
+    sp.set_defaults(func=cmd_kill)
+
+    # run
+    sp = sub.add_parser("run", help="Run command (send + Enter)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("command", metavar="CMD", help="Command to run")
+    sp.add_argument("-w", "--wait", action="store_true", help="Wait for prompt")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Wait timeout (default: {DEFAULT_WAIT_TIMEOUT})")
+    sp.set_defaults(func=cmd_run)
+
+    # send-text
+    sp = sub.add_parser("send-text", help="Send text (no Enter unless --enter)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("text", help="Text to send")
+    sp.add_argument("-e", "--enter", action="store_true", help="Send Enter after")
+    sp.set_defaults(func=cmd_send_text)
+
+    # send-key
+    sp = sub.add_parser("send-key", help="Send tmux key (C-c, Enter, Up, ...)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("key", help="Key (tmux notation)")
+    sp.set_defaults(func=cmd_send_key)
+
+    # send-mouse
+    sp = sub.add_parser(
+        "send-mouse",
+        help="Send mouse event in alternate screen mode",
+        description=(
+            "Send a mouse packet to the active TUI.\n"
+            "Target by visible text (with optional --nth) or by coordinates.\n"
+            "Coordinates are 0-based. Session must be in alternate screen mode."
+        ),
+    )
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    target_group = sp.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--text", metavar="TEXT", help="Target visible text (uses its center point)")
+    target_group.add_argument("--x", type=int, metavar="N", help="X coordinate (0-based, requires --y)")
+    sp.add_argument("--y", type=int, metavar="N", help="Y coordinate (0-based, required with --x)")
+    sp.add_argument("--nth", type=int, metavar="N", help="Select Nth text match (1-based) when --text is ambiguous")
+    sp.add_argument(
+        "--button",
+        choices=["left", "right"],
+        help="Mouse click button (default: left)",
+    )
+    scroll_group = sp.add_mutually_exclusive_group()
+    scroll_group.add_argument(
+        "-u",
+        "--scroll-up",
+        type=int,
+        nargs="?",
+        const=1,
+        metavar="N",
+        help="Send wheel-up event (optionally N times; default: 1)",
+    )
+    scroll_group.add_argument(
+        "-d",
+        "--scroll-down",
+        type=int,
+        nargs="?",
+        const=1,
+        metavar="N",
+        help="Send wheel-down event (optionally N times; default: 1)",
+    )
+    sp.add_argument(
+        "--mouse-encoding",
+        choices=["auto", "x10", "utf8", "sgr"],
+        default="auto",
+        help="Mouse packet encoding (default: auto)",
+    )
+    sp.set_defaults(func=cmd_send_mouse)
+
+    # capture
+    sp = sub.add_parser("capture", help="Capture screen (visible, trimmed)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-n", "--scrollback", type=int, metavar="N",
+                     help="Last N logical lines from scrollback+visible history (joins wrapped lines)")
+    sp.add_argument("-t", "--tail", type=int, metavar="N",
+                     help="Last N physical rows from bottom of visible screen")
+    sp.add_argument(
+        "-l",
+        "--line-numbers",
+        action="store_true",
+        help="Prefix output lines with 1-based row numbers (not with --scrollback)",
+    )
+    sp.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Allow --scrollback in alternate screen mode (may be stale/misleading)",
+    )
+    sp.add_argument("-r", "--raw", action="store_true",
+                    help="Include ANSI escape codes (colors)")
+    ann_mode = sp.add_mutually_exclusive_group()
+    ann_mode.add_argument("-a", "--annotate", action="store_true",
+                          help="Force annotations on")
+    ann_mode.add_argument("--no-annotate", action="store_true",
+                          help="Force annotations off")
+    sp.add_argument("--no-trim", action="store_true", help="Keep trailing whitespace")
+    sp.set_defaults(func=cmd_capture)
+
+    # pipe-log
+    sp = sub.add_parser("pipe-log", help="Stream to file (escapes stripped)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("file", metavar="PATH", help="Log file")
+    sp.add_argument("-r", "--raw", action="store_true", help="Keep ANSI escapes")
+    sp.set_defaults(func=cmd_pipe_log)
+
+    # unpipe
+    sp = sub.add_parser("unpipe", help="Stop streaming to file")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.set_defaults(func=cmd_unpipe)
+
+    # send-stdin
+    sp = sub.add_parser("send-stdin", help="Send stdin content to session")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.set_defaults(func=cmd_send_stdin)
+
+    # status (replaces old 'info' command)
+    sp = sub.add_parser("status", help="Show session status (idle/running, process tree)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.set_defaults(func=cmd_status)
+
+    # resize
+    sp = sub.add_parser("resize", help="Resize terminal")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-x", "--cols", type=int, metavar="N", help="New width")
+    sp.add_argument("-y", "--rows", type=int, metavar="N", help="New height")
+    sp.set_defaults(func=cmd_resize)
+
+    # scroll
+    sp = sub.add_parser("scroll", help="Scroll viewport (negative=up)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("lines", type=int, metavar="N", help="Lines (negative=up)")
+    sp.set_defaults(func=cmd_scroll)
+
+    # wait
+    sp = sub.add_parser("wait", help="Wait for prompt")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Timeout (default: {DEFAULT_WAIT_TIMEOUT})")
+    sp.set_defaults(func=cmd_wait)
+
+    # wait-idle
+    sp = sub.add_parser("wait-idle", help="Wait for output to stop")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-i", "--idle", type=float, metavar="SEC", help=f"Idle threshold (default: {DEFAULT_IDLE_SECONDS})")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Max wait (default: {DEFAULT_IDLE_TIMEOUT})")
+    sp.set_defaults(func=cmd_wait_idle)
+
+    # wait-for
+    sp = sub.add_parser("wait-for", help="Wait for pattern in output")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("patterns", nargs="+", metavar="PATTERN", help="Pattern(s) to wait for (first match wins)")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Timeout (default: {DEFAULT_WAIT_TIMEOUT})")
+    sp.add_argument("-i", "--ignore-case", action="store_true", help="Case-insensitive matching")
+    sp.add_argument("-p", "--print-match", action="store_true", help="Print the matched line")
+    sp.add_argument("-C", "--print-match-context", type=int, metavar="N", help="Print N lines of context around match (implies --print-match)")
+    sp.set_defaults(func=cmd_wait_for)
+
+    # upload
+    sp = sub.add_parser("upload",
+                        help="Upload local file to session, gzip-compressed (e.g. over SSH)",
+                        description="Upload a local file to the session's shell. Gzip-compressed, SHA-256 verified.\n"
+                                    "Requires python3 on the target system.\n"
+                                    "Session must be at a shell prompt (not running a command or TUI).")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("local_path", metavar="LOCAL_PATH",
+                    help="Local file to upload (use '-' for stdin)")
+    sp.add_argument("remote_path", metavar="REMOTE_PATH", nargs="?", default=None,
+                    help="Destination path (default: basename of LOCAL_PATH; required for stdin)")
+    sp.add_argument("-f", "--force", action="store_true", help="Overwrite if remote file exists")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC",
+                    help=f"Transfer timeout (default: {DEFAULT_TRANSFER_TIMEOUT})")
+    sp.add_argument("-v", "--verbose", action="store_true", help="Show transfer progress details")
+    sp.set_defaults(func=cmd_upload)
+
+    # download
+    sp = sub.add_parser("download",
+                        help="Download file from session, gzip-compressed",
+                        description="Download a file from the session's shell. Gzip-compressed, SHA-256 verified.\n"
+                                    "Requires python3 on the target system.\n"
+                                    "Session must be at a shell prompt (not running a command or TUI).")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("remote_path", metavar="REMOTE_PATH", help="Remote file to download")
+    sp.add_argument("local_path", metavar="LOCAL_PATH", nargs="?", default=None,
+                    help="Local destination (use '-' for stdout; default: basename of REMOTE_PATH)")
+    sp.add_argument("-f", "--force", action="store_true", help="Overwrite if local file exists")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC",
+                    help=f"Transfer timeout (default: {DEFAULT_TRANSFER_TIMEOUT})")
+    sp.add_argument("-v", "--verbose", action="store_true", help="Show transfer progress details")
+    sp.set_defaults(func=cmd_download)
+
+    # request
+    sp = sub.add_parser("request", help="Request human assistance")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-m", "--message", metavar="MSG", help="Message for human (shown in status bar)")
+    sp.set_defaults(func=cmd_request)
+
+    # request-wait
+    sp = sub.add_parser("request-wait", help="Wait for human to complete request")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Timeout (default: {DEFAULT_REQUEST_TIMEOUT})")
+    sp.set_defaults(func=cmd_request_wait)
+
+    # request-cancel
+    sp = sub.add_parser("request-cancel", help="Cancel pending request")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.set_defaults(func=cmd_request_cancel)
+
+    # request-status
+    sp = sub.add_parser("request-status", help="Check if request is pending (exit 0=pending, 1=none)")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.set_defaults(func=cmd_request_status)
+
+    return p
+
+# All valid command names for prefix matching
+COMMANDS = [
+    "list", "start", "kill", "run", "send-text", "send-key", "send-mouse", "send-stdin",
+    "capture", "pipe-log", "unpipe", "status", "resize", "scroll",
+    "wait", "wait-idle", "wait-for",
+    "upload", "download",
+    "request", "request-wait", "request-cancel", "request-status",
+]
+
+def _expand_command(cmd: str) -> str:
+    """Expand abbreviated command to full name if unambiguous."""
+    if cmd in COMMANDS:
+        return cmd
+    matches = [c for c in COMMANDS if c.startswith(cmd)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous command '{cmd}': could be {', '.join(sorted(matches))}")
+    return cmd  # Let argparse handle unknown command error
+
+def main(argv: list[str] | None = None) -> int:
+    global _tmux_socket
+    
+    parser = build_parser()
+    
+    # Expand abbreviated commands before parsing
+    # Handle global options like -L/--socket-name that come before the command
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)  # Make a mutable copy
+    
+    # Find the command (first non-option argument)
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith("-"):
+            # Skip option and its value if it takes one
+            if arg in ("-L", "--socket-name"):
+                skip_next = True
+            continue
+        # Found a command - try to expand it
+        try:
+            argv[i] = _expand_command(arg)
+        except ValueError as e:
+            _eprint(f"Error: {e}")
+            return EXIT_INPUT_ERROR
+        break
+    
+    args = parser.parse_args(argv)
+    
+    # Set global socket name if provided
+    if hasattr(args, 'socket_name') and args.socket_name:
+        _tmux_socket = args.socket_name
+
+    # Show help if no command given
+    if args.cmd is None:
+        parser.print_help()
+        return EXIT_SUCCESS
+
+    try:
+        args.func(args)
+        return EXIT_SUCCESS
+
+    except FileNotFoundError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_NOT_FOUND
+
+    except ValueError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_INPUT_ERROR
+
+    except OperationTimeout as e:
+        _eprint(f"Timeout: {e}")
+        return EXIT_TIMEOUT
+
+    except HumanDetached as e:
+        # Not an error per se - print message to stdout, return exit 4
+        print(str(e))
+        return EXIT_DETACHED
+
+    except AgentLocked as e:
+        _eprint(f"Error: {e}")
+        return EXIT_LOCKED
+
+    except OSError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_RUNTIME_ERROR
+
+    except QueryResult as e:
+        # Not an error - normal query result printed to stdout, specific exit code
+        print(str(e))
+        return e.exit_code
+
+    except RuntimeError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_RUNTIME_ERROR
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
