@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Gas comparison matrix using Foundry profiles.
+# Gas comparison matrix using Foundry profiles + CLI overrides.
 # Usage: bash scripts/gas_matrix.sh [profile ...]
-#        bash scripts/gas_matrix.sh          # all profiles
-#        bash scripts/gas_matrix.sh ir       # just via_ir=true
 set -euo pipefail
 cd "$(dirname "$0")/.."
-
 [[ -d testdata ]] || ./scripts/gen_testdata
 
-# Profiles to test (from foundry.toml)
-PROFILES=("${@:-default ir ir-opt via-ir-false-opt-runs-1 ssa ssa-opt}")
+if [ $# -eq 0 ]; then
+    PROFILES=(default ir-opt-no-opt ir-opt-opt ssa-no-opt ssa-opt)
+else
+    PROFILES=("$@")
+fi
+# Profiles are defined in foundry.toml
 
 printf "%-25s %-20s %12s %12s %8s\n" "PROFILE" "FILE" "REF_GAS" "YUL_GAS" "SAVE%"
 echo "------------------------- -------------------- ------------ ------------ --------"
