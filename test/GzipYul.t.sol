@@ -38,4 +38,11 @@ contract GzipYulTest is Test {
     function test_dynamicHuffman() public {
         assertEq(GzipYul.decompress(h2b("1f8b080000000000000305c1810140201440c155de044d6381e453c257546a7a77931752092e32676d17ab7eece5bc1fb44ae6f5c2614767d1cd4c5e4825b8c89cb55dacfab197f37ed02a99d70b871d9d453733792195e02273d676b1eac75ecefb41ab645e2f1c767416ddcc0f0c9c14af84000000")), bytes("The quick brown fox jumps over the lazy dog.The quick brown fox jumps over the lazy dog.The quick brown fox jumps over the lazy dog."));
     }
+
+    function test_dynamicSimple() public {
+        bytes memory gz = h2b("1f8b080000000000000305c10101000000c1b06c38fd23d924c9b69304a06db7edd9b23d3718000000");
+        bytes memory expected = bytes("AAAABBBBCCCCDDDDEEEEFFFF");
+        bytes memory r = GzipYul.decompress(gz);
+        assertEq(r, expected, "dynamic simple");
+    }
 }

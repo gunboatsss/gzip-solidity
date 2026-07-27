@@ -184,42 +184,45 @@ library GzipYul {
             }
 
             function htBuild(lens_ptr, lens_len) -> tbl {
-                let size := add(50, lens_len)
+                let size := add(560, lens_len)
                 tbl := mload(0x40)
                 mstore(0x40, add(tbl, size))
-                mstore(tbl, 0)
-                mstore(add(tbl, 32), 0)
-                mstore(add(tbl, 64), 0)
-                mstore(add(tbl, 48), lens_len)
-                let dst := add(tbl, 50)
+                // zero firstCode (16 × uint256 = 512 bytes)
+                for { let i := 0 } lt(i, 16) { i := add(i, 1) } {
+                    mstore(add(tbl, shl(5, i)), 0)
+                }
+                // zero blCount (16 bytes at tbl+512)
+                mstore(add(tbl, 512), 0)
+                mstore(add(tbl, 528), lens_len)
+                let dst := add(tbl, 560)
                 for { let i := 0 } lt(i, lens_len) { i := add(i, 1) } {
                     let l := shr(248, mload(add(lens_ptr, i)))
                     mstore8(add(dst, i), l)
                     if l {
-                        let cp := add(add(tbl, 32), l)
+                        let cp := add(add(tbl, 512), l)
                         mstore8(cp, add(shr(248, mload(cp)), 1))
                     }
                 }
                 let code := 0
                 for { let bits := 1 } lt(bits, 16) { bits := add(bits, 1) } {
                     code := shl(1, add(code,
-                        shr(248, mload(add(add(tbl, 32), sub(bits, 1))))))
-                    mstore(add(tbl, shl(1, bits)), code)
+                        shr(248, mload(add(add(tbl, 512), sub(bits, 1))))))
+                    mstore(add(tbl, shl(5, bits)), code)
                 }
             }
 
             function htDecode(tbl, s) -> sym {
                 let code := 0
-                let nSyms := mload(add(tbl, 48))
+                let nSyms := mload(add(tbl, 528))
                 for { let l := 1 } lt(l, 16) { l := add(l, 1) } {
                     code := or(shl(1, code), readBit(s))
-                    let cnt := shr(248, mload(add(add(tbl, 32), l)))
+                    let cnt := shr(248, mload(add(add(tbl, 512), l)))
                     if iszero(cnt) { continue }
-                    let first := and(mload(add(tbl, shl(1, l))), 0xFFFF)
+                    let first := mload(add(tbl, shl(5, l)))
                     if and(iszero(lt(code, first)), lt(code, add(first, cnt))) {
                         let off := sub(code, first)
                         let c := 0
-                        let ls := add(tbl, 50)
+                        let ls := add(tbl, 560)
                         for { let x := 0 } lt(x, nSyms) { x := add(x, 1) } {
                             if eq(shr(248, mload(add(ls, x))), l) {
                                 if eq(c, off) { sym := x leave }
