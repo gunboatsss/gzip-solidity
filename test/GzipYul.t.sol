@@ -45,4 +45,20 @@ contract GzipYulTest is Test {
         bytes memory r = GzipYul.decompress(gz);
         assertEq(r, expected, "dynamic simple");
     }
+
+    function test_errorSelectors() public {
+        bytes memory bad = h2b("0000000000000000000000000000000000000000");
+        vm.expectRevert(GzipYul.GzipInvalidMagic.selector);
+        this.extDecompress(bad);
+    }
+
+    function test_errorTooShort() public {
+        bytes memory bad = h2b("1f8b");
+        vm.expectRevert(GzipYul.GzipInputTooShort.selector);
+        this.extDecompress(bad);
+    }
+
+    function extDecompress(bytes memory input) external pure returns (bytes memory) {
+        return GzipYul.decompress(input);
+    }
 }

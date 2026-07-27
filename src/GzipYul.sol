@@ -6,6 +6,12 @@ pragma solidity ^0.8.13;
  * @notice Pure‑Yul gzip decompression with memory‑state architecture.
  */
 library GzipYul {
+    // Error selectors (pre-computed, used directly in assembly)
+    // keccak256("GzipInvalidMagic()")      = 0xb0f25b04
+    // keccak256("GzipInputTooShort()")     = 0x6d1e0b23
+    // keccak256("GzipCrc32Mismatch(uint32,uint32)") = 0x6d9f3e27
+    // keccak256("GzipIsizeMismatch(uint32,uint32)") = 0x61025233
+
     error GzipInvalidMagic();
     error GzipInputTooShort();
     error GzipCrc32Mismatch(uint32 expected, uint32 actual);
@@ -16,16 +22,25 @@ library GzipYul {
             // ═══════════════════════════════════════════════════════
             //  GZIP HEADER
             // ═══════════════════════════════════════════════════════
-            if lt(mload(input), 18) { revert(0, 0) }
+            if lt(mload(input), 18) {
+                mstore(0, 0x6d1e0b2300000000000000000000000000000000000000000000000000000000)
+                revert(0, 4)
+            }
             let in_ptr := add(input, 0x20)
             if or(
                 iszero(eq(shr(248, mload(in_ptr)), 0x1F)),
                 iszero(eq(shr(248, mload(add(in_ptr, 1))), 0x8B))
-            ) { revert(0, 0) }
+            ) {
+                mstore(0, 0xb0f25b0400000000000000000000000000000000000000000000000000000000)
+                revert(0, 4)
+            }
 
             let pos := 2
             let cm := shr(248, mload(add(in_ptr, pos)))
-            if iszero(eq(cm, 0x08)) { revert(0, 0) }
+            if iszero(eq(cm, 0x08)) {
+                mstore(0, 0xb0f25b0400000000000000000000000000000000000000000000000000000000)
+                revert(0, 4)
+            }
             pos := add(pos, 1)
             let flg := shr(248, mload(add(in_ptr, pos)))
             pos := add(pos, 7)
@@ -50,7 +65,10 @@ library GzipYul {
                 if lt(pos, mload(input)) { pos := add(pos, 1) }
             }
             if and(flg, 0x02) { pos := add(pos, 2) }
-            if lt(mload(input), add(pos, 8)) { revert(0, 0) }
+            if lt(mload(input), add(pos, 8)) {
+                mstore(0, 0x6d1e0b2300000000000000000000000000000000000000000000000000000000)
+                revert(0, 4)
+            }
 
             let footer_start := sub(mload(input), 8)
             let footer_ptr := add(in_ptr, footer_start)
@@ -178,9 +196,8 @@ library GzipYul {
                 if iszero(lt(code, 400)) {
                     if lt(code, 512) { sym := add(144, sub(code, 400)) leave }
                 }
-                mstore(0, 0x08c379a000000000000000000000000000000000000000000000000000000000)
-                mstore(4, "DEFL:INV")
-                revert(0, 0x24)
+                // invalid Huffman code — revert without data
+                revert(0, 0)
             }
 
             function htBuild(lens_ptr, lens_len) -> tbl {
@@ -461,14 +478,16 @@ library GzipYul {
 
 
             if iszero(eq(act_crc, exp_crc)) {
-                mstore(0, 0x08c379a000000000000000000000000000000000000000000000000000000000)
-                mstore(4, "CRC32")
-                revert(0, 0x24)
+                mstore(0, 0x6d9f3e2700000000000000000000000000000000000000000000000000000000)
+                mstore(4, exp_crc)
+                mstore(36, act_crc)
+                revert(0, 68)
             }
             if iszero(eq(and(olen, 0xFFFFFFFF), exp_isize)) {
-                mstore(0, 0x08c379a000000000000000000000000000000000000000000000000000000000)
-                mstore(4, "ISIZE")
-                revert(0, 0x24)
+                mstore(0, 0x6102523300000000000000000000000000000000000000000000000000000000)
+                mstore(4, exp_isize)
+                mstore(36, and(olen, 0xFFFFFFFF))
+                revert(0, 68)
             }
         }
     }
